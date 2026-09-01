@@ -1,54 +1,9 @@
 # =====================================================================
 # 34_content_null_with_a_film.R
-#
-# Act IV of the worked-example thread: the content-feature null result,
-# told through one film rather than one confidence interval.
-#
+
 # Run INSIDE the 06b_M3_training session, after section 8.
 # Needs: m2e, m3a, m3b, Cmat (content matrix), dat_test, test, movie_map,
-#        support, ordrec_probs_m3, tidy_probs, LEVELS5, OUT_DIR, SEED,
-#        title_of  (define it if 06b does not)
-#
-# ---------------------------------------------------------------------
-# WHAT A NULL RESULT NEEDS THAT A POSITIVE ONE DOES NOT
-#
-# A positive result is carried by its interval: the effect is there, the
-# interval excludes zero, the reader is persuaded. A null result is not
-# carried by its interval, because an interval spanning zero is
-# compatible with two very different states of the world -- the content
-# features carry no signal, or they carry signal the model cannot reach.
-# An examiner will ask which, and "the CI included zero" does not answer.
-#
-# Three things separate the two readings, and this file does them in
-# order.
-#
-# (1) IS THE SIGNAL THERE AT ALL? If content features predict ratings
-#     when used directly, but add nothing on top of the factors, the
-#     null is about REDUNDANCY, not about absence. Section 1 regresses
-#     the residual on the content block. This is the difference between
-#     "genre does not predict taste" (false, and the reader knows it is
-#     false) and "genre predicts nothing the factors have not already
-#     learned" (the actual claim).
-#
-# (2) WHERE SHOULD IT HAVE HELPED MOST? The cold-item argument is the
-#     one reason to expect content features to earn their place: a film
-#     with ten ratings has a barely-estimated factor, and its genre and
-#     cast are known regardless. Section 8 of 06b already stratifies by
-#     item support. Section 2 here goes further and asks whether the
-#     films where M3 helps are the ones the argument predicts, or
-#     whether the sign is scattered.
-#
-# (3) WHAT DOES IT LOOK LIKE ON ONE FILM? Section 3 selects a film that
-#     the cold-item argument would nominate -- low support, rich and
-#     unambiguous content, a clear genre neighbourhood -- and shows what
-#     M3 does to its predictions. A null shown on a named film with a
-#     known cast is harder to dismiss than a null shown as an interval.
-#
-# ON SELECTION DISCIPLINE. The film is chosen by a stated rule applied
-# before its outcome is examined, and the rule is recorded here. The
-# alternative -- searching for the film that best illustrates the point
-# -- would make the example decorative. The rule below nominates a small
-# set; the file prints all of them and the write-up takes the first.
+#        support, ordrec_probs_m3, tidy_probs, LEVELS5, OUT_DIR, SEED
 # =====================================================================
 
 suppressPackageStartupMessages({ library(data.table); library(ggplot2) })
@@ -132,8 +87,7 @@ cat("is the sentence the null result deserves.\n")
 # The argument for content features is that a film with few ratings has
 # a badly estimated factor and known content. If that argument is right,
 # the per-film gain should decline with support. Section 8 of 06b tests
-# this on four strata; here it is tested as a trend, per film, so that a
-# monotone pattern is distinguishable from one stratum moving alone.
+# this on four strata.
 
 test[, movie_idx := dat_test$i][, n_train_item := support$n_train[movie_idx]]
 per_film <- test[, .(n_rows = .N, n_train = n_train_item[1],
@@ -175,9 +129,7 @@ cat(sprintf("  95%% CI [%+.3f, %+.3f]%s\n",
 #   - at least 5 test rows, so the per-film mean is not one person;
 # take the film whose content vector has the MOST near neighbours in the
 # training set. A film with many content neighbours is the easiest
-# possible case for a content model: whatever the features encode, there
-# is a well-populated neighbourhood to borrow from. If M3 cannot help
-# there, the reason is not that the film is unusual.
+# possible case for a content model.
 
 cand <- per_film[n_train %between% c(10, 50) & n_rows >= 5]
 if (nrow(cand) == 0) cand <- per_film[n_train <= 100 & n_rows >= 3]
