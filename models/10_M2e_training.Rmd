@@ -1,5 +1,5 @@
 ---
-title: "M2e: Joint OrdRec with Per-User Thresholds (the Paper's Configuration)"
+title: "M2e: Joint OrdRec with Per-User Thresholds"
 author: "Dina Muhamaitihan | Movie Recommendation"
 output:
   pdf_document:
