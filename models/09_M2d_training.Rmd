@@ -1,0 +1,799 @@
+---
+title: "M2d: Joint OrdRec with Global Thresholds"
+author: "Dina Muhamaitihan | Movie Recommendation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+library(data.table)
+library(ggplot2)
+library(ordinal)
+library(recosystem)
+library(knitr)
+```
+
+## Aim
+
+M2d is the first model in the ladder where the factors are **learned under
+the ordinal likelihood** instead of being frozen at the squared-error SVD.
+The latent score is plain matrix factorisation with biases,
+
+$$y_{ui} = b_i + b_u + q_i^\top p_u,$$
+
+wrapped in the OrdRec cumulative-logit shell of Koren and Sill (2011):
+$t_1$ free, $t_{r+1} = t_r + \exp(\beta_r)$ (their eqs. 4–5, monotone by
+construction), $P(r_{ui} \le r) = \sigma(t_r - y_{ui})$ (their eq. 9), and
+stochastic gradient ascent on the log-likelihood (their eqs. 11–12).
+
+Our stated deviation from the paper: they wrap SVD++ (their eq. 3, with the
+implicit-feedback term $|R(u)|^{-1/2}\sum_j x_j$); we wrap plain MF. The
+ordinal shell is unchanged, and the paper itself notes any internal scorer
+can be used. A second, smaller deviation is recorded in Section 3: gradient
+updates are applied in mini-batches rather than one row at a time.
+
+**Why M2d matters for this dissertation.** NDCG\@10 and FCP are identical
+across M1–M2c because those models share one frozen latent score. Joint
+training is the only step on the ladder where the ranking can move. This
+file answers whether it does.
+
+**Trust chain.** Every likelihood and gradient formula used below is
+byte-identical to the functions in `08_M2d_gradient_check.R`, which passed
+(a) a numerical gradient check to max relative error 5e-09, and (b) a
+frozen-factor cross-check against `ordinal::clm` agreeing to 2e-08 in the
+thresholds and to machine precision in the log-likelihood. The mini-batch
+trainer additionally passes the synthetic-recovery self-test in Section 3.
+
+---
+
+## 0. Settings
+
+```{r config}
+# --- edit these three paths (same as 07) ------------------------------
+SEL_FILE  <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/00_data_selection/selection_v7_2018-04_6m_Nu10_Nm10.rds"
+OUT_DIR   <- "D:/桌面/movie-recommendation-dissertation/06_models/output/07_M1_M2"
+CACHE_DIR <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/07_M1_M2"
+# ----------------------------------------------------------------------
+
+dir.create(OUT_DIR,   showWarnings = FALSE, recursive = TRUE)
+dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---- scan slicing ----------------------------------------------------
+# Set BEFORE sourcing config_grids.R. Split the grid across several R
+# sessions to parallelise by hand: session j of m uses c(j, m).
+# Single session: c(1L, 1L).
+SCAN_SLICE <- c(1L, 1L)
+
+# Shared grid, protocol and constants for M2d and M2e. Defined in one
+# place so the two models cannot drift apart: the supervisor asked for
+# the M2e tuning to be done "for consistency", and consistency here means
+# an identical search space under an identical protocol.
+source("config_grids.R")
+
+RUN_M2C <- TRUE      # clmm2 takes ~20 min; the fit is cached after the first run
+
+n_cores <- parallel::detectCores()
+set.seed(SEED)
+```
+
+---
+
+## 1. Load the Selection (identical to 07)
+
+```{r load-data}
+sel   <- readRDS(SEL_FILE)
+fit   <- as.data.table(sel$fit)
+calib <- as.data.table(sel$calib)
+test  <- as.data.table(sel$test)
+
+to_int5 <- function(d) { d[, rating5 := as.integer(as.character(rating5))]; d[] }
+fit <- to_int5(fit); calib <- to_int5(calib); test <- to_int5(test)
+
+user_map  <- data.table(userId  = sort(unique(fit$userId)))[,  user_idx  := .I]
+movie_map <- data.table(movieId = sort(unique(fit$movieId)))[, movie_idx := .I]
+add_idx <- function(d) {
+  d <- merge(d, user_map,  by = "userId",  all.x = TRUE, sort = FALSE)
+  d <- merge(d, movie_map, by = "movieId", all.x = TRUE, sort = FALSE)
+  setDT(d)
+  d[, cold := is.na(user_idx) | is.na(movie_idx)]
+  d[]
+}
+fit   <- add_idx(fit)[cold == FALSE]
+calib <- add_idx(calib)[cold == FALSE]
+test  <- add_idx(test)[cold == FALSE]
+
+nU <- nrow(user_map); nI <- nrow(movie_map)
+cat(sprintf("fit %d | calib %d | test %d | users %d | movies %d\n",
+            nrow(fit), nrow(calib), nrow(test), nU, nI))
+stopifnot(nrow(fit) == 393364L)   # guard against loading a stale selection
+```
+
+---
+
+## 2. Core Functions
+
+The model core (`expand_thresholds`, `sigmoid`, `ordrec_forward`) is copied
+verbatim from `08_M2d_gradient_check.R`. Metric functions are copied from
+07 so the evaluation protocol is bit-identical across the ladder.
+
+```{r core-functions}
+# ---- OrdRec core (verbatim from 08, where it passed both checks) -----
+expand_thresholds <- function(t1, beta) c(t1, t1 + cumsum(exp(beta)))
+sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
+
+ordrec_forward <- function(y, r, th) {
+  g_hi <- ifelse(r == K_LEVELS, 1, sigmoid(th[pmin(r, K_LEVELS - 1L)] - y))
+  g_lo <- ifelse(r == 1L,       0, sigmoid(th[pmax(r - 1L, 1L)]       - y))
+  A <- g_hi * (1 - g_hi)
+  B <- g_lo * (1 - g_lo)
+  list(prob = pmax(g_hi - g_lo, 1e-12), A = A, B = B)
+}
+
+calc_scores <- function(par, u, i)
+  par$bi[i] + par$bu[u] + rowSums(par$P[u, , drop = FALSE] *
+                                  par$Q[i, , drop = FALSE])
+
+ordrec_mean_ll <- function(par, dat) {
+  y  <- calc_scores(par, dat$u, dat$i)
+  th <- expand_thresholds(par$t1, par$beta)
+  mean(log(ordrec_forward(y, dat$r, th)$prob))
+}
+
+# Full 5-column probability matrix for evaluation. Same cumulative-logit
+# formula as cum_probs in 07; written against the par list for convenience.
+ordrec_probs <- function(par, u, i) {
+  y  <- calc_scores(par, u, i)
+  th <- expand_thresholds(par$t1, par$beta)
+  CP <- sapply(th, function(t) plogis(t - y))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(y))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+# ---- metrics, verbatim from 07 ---------------------------------------
+tidy_probs <- function(P) { P <- pmax(P, 1e-12); P / rowSums(P) }
+
+gauss_probs <- function(y, sigma) {
+  y  <- as.numeric(y)
+  CP <- sapply(CUTS, function(c) pnorm((c - y) / sigma))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(y))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+cum_probs <- function(theta, eta) {
+  eta <- as.numeric(eta)
+  CP  <- sapply(theta, function(t) plogis(t - eta))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(eta))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+metric_set <- function(P, y) {
+  y   <- as.integer(y); P <- tidy_probs(P); n <- nrow(P)
+  ll  <- log(P[cbind(seq_len(n), y)])
+  E   <- as.numeric(P %*% LEVELS5)
+  CP  <- t(apply(P, 1, cumsum))
+  IND <- outer(y, LEVELS5, function(a, b) as.numeric(a <= b))
+  rps <- rowSums((CP[, 1:(K_LEVELS - 1)] - IND[, 1:(K_LEVELS - 1)])^2) / (K_LEVELS - 1)
+  list(row_ll = ll,
+       tbl = data.table(meanLL = mean(ll),
+                        RMSE   = sqrt(mean((y - E)^2)),
+                        RPS    = mean(rps),
+                        CatAcc = mean(max.col(P, ties.method = "first") == y)))
+}
+
+ndcg_at_10 <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), rel = 2^as.integer(y) - 1)
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0) return(NA_real_)
+  per_user <- d[, {
+    k    <- min(10L, .N)
+    dcg  <- sum(rel[order(-s)][1:k]   / log2(seq_len(k) + 1))
+    idcg <- sum(rel[order(-rel)][1:k] / log2(seq_len(k) + 1))
+    .(ndcg = if (idcg > 0) dcg / idcg else NA_real_)
+  }, by = uid]
+  mean(per_user$ndcg, na.rm = TRUE)
+}
+
+fcp_stat <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), y = as.integer(y))
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0)
+    return(list(FCP = NA_real_, nc = 0L, nd = 0L, n_pairs = 0L, n_users = 0L))
+  per_user <- d[, {
+    sy_gt <- outer(y, y, `>`); sy_lt <- outer(y, y, `<`)
+    ss_gt <- outer(s, s, `>`); ss_ge <- outer(s, s, `>=`)
+    list(nc = sum(ss_gt & sy_gt), nd = sum(ss_ge & sy_lt))
+  }, by = uid]
+  nc <- sum(per_user$nc); nd <- sum(per_user$nd)
+  list(FCP = nc / (nc + nd), nc = nc, nd = nd,
+       n_pairs = nc + nd, n_users = uniqueN(d$uid))
+}
+```
+
+---
+
+## 3. The Mini-Batch SGD Trainer
+
+Koren and Sill update after every single rating (their eq. 12). Here
+gradients are accumulated over shuffled mini-batches of `r BATCH_SIZE` rows
+and applied once per batch — identical in expectation, and the practical
+choice in R, where per-row loops are two orders of magnitude slower than
+vectorised batches.
+
+Two details, both discovered by testing rather than assumed:
+
+1. **Thresholds get the batch-mean gradient, entity parameters the batch
+   sum.** A user or item appears in a batch a handful of times, so the sum
+   over the batch is the same movement per-row SGD would have produced.
+   The thresholds are touched by *every* row; summing their gradients over
+   a batch multiplies the step by the batch size and the training diverges
+   (verified). Dividing by the batch size restores the scale. This is a
+   per-parameter-type learning rate, which is exactly what Koren and Sill
+   describe using in their Section 6.1.
+2. **Per-row gradient terms are capped at `r CLIP`.** The terms
+   $A/p$ and $B/p$ blow up when the model is confidently wrong ($p \to 0$).
+   The cap is a safeguard; the fraction of rows where it binds is reported
+   for every run and should be ~0 for the chosen configuration.
+
+Regularisation is L2 on biases and factors, applied per occurrence as in
+the paper's eq. 12; the thresholds are left unpenalised (four global
+parameters against 393k rows do not overfit, and shrinking thresholds
+towards zero has no meaningful prior interpretation).
+
+```{r trainer}
+train_ordrec_m2d <- function(dat_fit, dat_calib, init, eta, lambda,
+                             batch_size = BATCH_SIZE, max_epochs = MAX_EPOCHS,
+                             patience = PATIENCE, seed = SEED, clip = CLIP,
+                             eta_decay = ETA_DECAY, verbose = TRUE) {
+  par <- init
+  n <- length(dat_fit$u)
+  best <- list(ll = -Inf, par = par, epoch = 0L)
+  hist <- data.table(epoch = integer(), fit_meanLL = numeric(),
+                     calib_meanLL = numeric(), clip_rate = numeric())
+  set.seed(seed)
+  eta_e <- eta
+  for (ep in seq_len(max_epochs)) {
+    perm <- sample.int(n)
+    n_clip <- 0L
+    for (b0 in seq(1L, n, by = batch_size)) {
+      idx <- perm[b0:min(b0 + batch_size - 1L, n)]
+      u <- dat_fit$u[idx]; i <- dat_fit$i[idx]; r <- dat_fit$r[idx]
+
+      y  <- calc_scores(par, u, i)
+      th <- expand_thresholds(par$t1, par$beta)
+      fw <- ordrec_forward(y, r, th)
+      c_hi <- fw$A / fw$prob; c_lo <- fw$B / fw$prob
+      n_clip <- n_clip + sum(c_hi > clip) + sum(c_lo > clip)
+      c_hi <- pmin(c_hi, clip); c_lo <- pmin(c_lo, clip)
+      dy <- c_lo - c_hi                                   # dl/dy per row
+
+      # thresholds: batch-MEAN gradient (see note above)
+      d_t1 <- sum(c_hi - c_lo)
+      d_be <- vapply(1:(K_LEVELS - 2L), function(s)
+        exp(par$beta[s]) * sum(c_hi * (s <= r - 1L) - c_lo * (s <= r - 2L)),
+        numeric(1))
+      par$t1   <- par$t1   + eta_e * d_t1 / length(idx)
+      par$beta <- par$beta + eta_e * d_be / length(idx)
+
+      # users: batch-SUM gradient, per-occurrence L2 (paper eq. 12)
+      su <- rowsum(dy, u); ug <- as.integer(rownames(su))
+      nu <- as.numeric(rowsum(rep(1, length(u)), u))
+      par$bu[ug] <- par$bu[ug] + eta_e * (as.numeric(su) - lambda * nu * par$bu[ug])
+      SP <- rowsum(dy * par$Q[i, , drop = FALSE], u)
+      par$P[ug, ] <- par$P[ug, ] + eta_e * (SP - lambda * nu * par$P[ug, , drop = FALSE])
+
+      # items
+      si <- rowsum(dy, i); ig <- as.integer(rownames(si))
+      ni <- as.numeric(rowsum(rep(1, length(i)), i))
+      par$bi[ig] <- par$bi[ig] + eta_e * (as.numeric(si) - lambda * ni * par$bi[ig])
+      SQ <- rowsum(dy * par$P[u, , drop = FALSE], i)
+      par$Q[ig, ] <- par$Q[ig, ] + eta_e * (SQ - lambda * ni * par$Q[ig, , drop = FALSE])
+
+      if (!is.finite(par$t1) || any(!is.finite(par$beta)))
+        return(list(diverged = TRUE, best_ll = -Inf, best_epoch = 0L,
+                    history = hist))
+    }
+    ll_c <- ordrec_mean_ll(par, dat_calib)
+    ll_f <- ordrec_mean_ll(par, dat_fit)
+    hist <- rbind(hist, data.table(epoch = ep, fit_meanLL = ll_f,
+                                   calib_meanLL = ll_c, clip_rate = n_clip / n))
+    if (verbose) cat(sprintf("    epoch %2d  fit %.5f  calib %.5f  clip %.5f%%\n",
+                             ep, ll_f, ll_c, 100 * n_clip / n))
+    if (ll_c > best$ll + 1e-5) {
+      best <- list(ll = ll_c, par = par, epoch = ep)
+    } else if (ep - best$epoch >= patience) break
+    eta_e <- eta_e * eta_decay
+  }
+  list(diverged = FALSE, best_ll = best$ll, par = best$par,
+       best_epoch = best$epoch, history = hist)
+}
+```
+
+### Synthetic self-test
+
+Before touching real data: generate ratings from known parameters, train
+from a cold start, and require the trainer to (a) clearly beat the marginal
+baseline and (b) land near the oracle likelihood. Runs in a few seconds; if
+it ever fails after an edit to the trainer, believe the test, not the edit.
+
+```{r trainer-selftest}
+set.seed(7)
+.nU <- 400L; .nI <- 200L; .K <- 8L
+.true <- list(t1 = 0.5, beta = log(c(1.2, 1.6, 2.0)),
+              bu = rnorm(.nU, 0, 0.5), bi = rnorm(.nI, 0, 0.5),
+              P = matrix(rnorm(.nU * .K, 0, 0.55), .nU, .K),
+              Q = matrix(rnorm(.nI * .K, 0, 0.55), .nI, .K))
+.gen <- function(n) {
+  u <- sample(.nU, n, TRUE); i <- sample(.nI, n, TRUE)
+  y  <- calc_scores(.true, u, i)
+  th <- expand_thresholds(.true$t1, .true$beta)
+  G  <- sapply(th, function(t) sigmoid(t - y)); G <- cbind(G, 1)
+  P5 <- cbind(G[, 1], G[, 2:5] - G[, 1:4])
+  list(u = u, i = i,
+       r = as.integer(apply(P5, 1, function(p) sample.int(5, 1, prob = p))))
+}
+.df <- .gen(60000L); .dc <- .gen(15000L)
+.oracle <- ordrec_mean_ll(.true, .dc)
+.marg   <- prop.table(tabulate(.df$r, 5))
+.mll    <- mean(log(.marg[.dc$r]))
+.cum    <- qlogis(cumsum(.marg)[1:4])
+.cold   <- list(t1 = .cum[1], beta = log(pmax(diff(.cum), 1e-3)),
+                bu = rep(0, .nU), bi = rep(0, .nI),
+                P = matrix(rnorm(.nU * .K, 0, 0.05), .nU, .K),
+                Q = matrix(rnorm(.nI * .K, 0, 0.05), .nI, .K))
+.res <- train_ordrec_m2d(.df, .dc, .cold, eta = 0.03, lambda = 0.01,
+                         verbose = FALSE)
+cat(sprintf("synthetic: trained %.5f | oracle %.5f | marginal %.5f\n",
+            .res$best_ll, .oracle, .mll))
+stopifnot(!.res$diverged, .res$best_ll > .mll + 0.05,
+          .res$best_ll > .oracle - 0.06)
+cat("TRAINER SELF-TEST: PASS\n")
+rm(.df, .dc, .true, .cold, .res)
+```
+
+---
+
+## 4. Baselines Recomputed (M1, M2a, M2b, M2c)
+
+Self-contained rebuild of the comparison models so the bootstrap can use
+per-row log-likelihoods from a single session. The SVD here also supplies
+M2d's warm start. `recosystem` is multi-threaded and not bit-reproducible,
+so these numbers may differ from 07 in the third or fourth decimal; every
+comparison in this file is internally consistent because all models see
+this session's scores. The 20-minute `clmm2` fit for M2c is cached.
+
+```{r baselines}
+
+# 读 07 缓存的调优 SVD 因子(dim=16, L2=0.05)。09 不再自己训 recosystem
+nU <- nrow(user_map); nI <- nrow(movie_map)  # 来自第1节,这里确保一下
+svd_cache <- readRDS(file.path(CACHE_DIR, "svd_factors.rds"))
+stopifnot(identical(as.integer(svd_cache$user_map$userId),   as.integer(user_map$userId)),
+          identical(as.integer(svd_cache$movie_map$movieId), as.integer(movie_map$movieId)),
+          svd_cache$dim == SVD_DIM,
+          nrow(svd_cache$P) == nU, nrow(svd_cache$Q) == nI)
+
+# 读 07 缓存的调优 SVD 因子(dim=16, L2=0.05)。09 不再自己训 recosystem:
+# 它多线程、非 bit-可复现,正是旧 09 基线和 07 在第 3–4 位小数漂移的根源。
+# 读缓存后,M1/M2a/M2b/M2c 与 M2d 的 warm start 共享同一组固定因子,与 07 对齐。
+svd_cache <- readRDS(file.path(CACHE_DIR, "svd_factors.rds"))
+stopifnot(identical(as.integer(svd_cache$user_map$userId),   as.integer(user_map$userId)),
+          identical(as.integer(svd_cache$movie_map$movieId), as.integer(movie_map$movieId)),
+          svd_cache$dim == SVD_DIM,
+          nrow(svd_cache$P) == nU, nrow(svd_cache$Q) == nI)
+Pmat <- svd_cache$P    # nU x dim, 第 k 行 = user_map$userId[k]
+Qmat <- svd_cache$Q    # nI x dim, 第 k 行 = movie_map$movieId[k]
+cat(sprintf("Loaded SVD factors from cache (dim=%d, L2=%g)\n",
+            svd_cache$dim, svd_cache$l2))
+
+svd_score_vec <- function(u, i)
+  rowSums(Pmat[u, , drop = FALSE] * Qmat[i, , drop = FALSE])
+calib[, svd_score := svd_score_vec(user_idx, movie_idx)]
+test[,  svd_score := svd_score_vec(user_idx, movie_idx)]
+calib[, svd_clip := pmin(pmax(svd_score, 1), 5)]
+test[,  svd_clip := pmin(pmax(svd_score, 1), 5)]
+
+# M1
+sigma_m1 <- sqrt(mean((as.numeric(calib$rating5) - calib$svd_clip)^2))
+P_m1 <- gauss_probs(test$svd_clip, sigma_m1)
+
+# M2a / M2b
+calib[, rating_f := factor(rating5, levels = LEVELS5, ordered = TRUE)]
+m2a <- clm(rating_f ~ svd_score, data = calib, link = "logit",
+           threshold = "equidistant")
+m2b <- clm(rating_f ~ svd_score, data = calib, link = "logit",
+           threshold = "flexible")
+th_a <- as.numeric(m2a$alpha); b_a <- as.numeric(m2a$beta)
+th_a <- th_a[1] + (0:3) * th_a[2]
+th_b <- as.numeric(m2b$alpha); b_b <- as.numeric(m2b$beta)
+P_m2a <- cum_probs(th_a, b_a * test$svd_score)
+P_m2b <- cum_probs(th_b, b_b * test$svd_score)
+
+# M2c (cached: clmm2 is the slow one)
+m2c_cache <- file.path(CACHE_DIR, "m2c_params.rds")
+if (RUN_M2C) {
+  if (file.exists(m2c_cache)) {
+    m2c_par <- readRDS(m2c_cache)
+    cat("Loaded cached M2c parameters.\n")
+  } else {
+    calib[, user_f := factor(userId)]
+    t0 <- Sys.time()
+    m2c <- clmm2(rating_f ~ svd_score, random = user_f, data = calib,
+                 link = "logistic", Hess = TRUE, nAGQ = 1)
+    cat(sprintf("clmm2 fitted in %.1f minutes\n",
+                as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+    re <- m2c$ranef
+    if (is.null(names(re))) names(re) <- levels(calib$user_f)
+    m2c_par <- list(Theta = as.numeric(m2c$Theta),
+                    beta  = as.numeric(m2c$beta)[1],
+                    ranef = re, stDev = as.numeric(m2c$stDev))
+    saveRDS(m2c_par, m2c_cache)
+  }
+  bu_c <- m2c_par$ranef[as.character(test$userId)]
+  bu_c[is.na(bu_c)] <- 0
+  P_m2c <- cum_probs(m2c_par$Theta,
+                     m2c_par$beta * test$svd_score + as.numeric(bu_c))
+}
+```
+
+---
+
+## 5. Initialisation for M2d
+
+**Warm start** takes the SVD's own factor matrices (so M2d starts exactly
+where M1's internal scorer stands) with zero biases, and sets the four
+thresholds by maximising the ordinal likelihood on the fit set with the
+factors frozen — the cheap four-parameter BFGS that was cross-checked
+against `clm` in 08. **Cold start** uses small random factors and
+thresholds matched to the marginal rating distribution of the fit set
+($t_k = \mathrm{logit}$ of the empirical $P(r \le k)$, so the model starts
+as the marginal predictor). Running both answers the reviewer question of
+whether the joint solution merely orbits the SVD it was seeded with.
+
+```{r inits}
+# warm-start 因子就是第 4 节读入的缓存 SVD 因子
+fac <- list(P = Pmat, Q = Qmat)
+stopifnot(nrow(fac$P) == nU, nrow(fac$Q) == nI)
+
+dat_fit   <- list(u = fit$user_idx,   i = fit$movie_idx,   r = fit$rating5)
+dat_calib <- list(u = calib$user_idx, i = calib$movie_idx, r = calib$rating5)
+dat_test  <- list(u = test$user_idx,  i = test$movie_idx,  r = test$rating5)
+
+# thresholds for the warm start: frozen-factor BFGS on the fit set
+ordrec_frozen_llgr <- function(v, y, r) {
+  th <- expand_thresholds(v[1], v[2:4])
+  fw <- ordrec_forward(y, r, th)
+  d_t1 <- sum((fw$A - fw$B) / fw$prob)
+  d_be <- vapply(1:3, function(s)
+    exp(v[1 + s]) * sum((fw$A * (s <= r - 1L) - fw$B * (s <= r - 2L)) / fw$prob),
+    numeric(1))
+  list(ll = sum(log(fw$prob)), gr = c(d_t1, d_be))
+}
+y_warm_fit <- rowSums(fac$P[dat_fit$u, ] * fac$Q[dat_fit$i, ])
+opt <- optim(c(0, 0, 0, 0),
+             fn = function(v) -ordrec_frozen_llgr(v, y_warm_fit, dat_fit$r)$ll,
+             gr = function(v) -ordrec_frozen_llgr(v, y_warm_fit, dat_fit$r)$gr,
+             method = "BFGS", control = list(maxit = 500, reltol = 1e-12))
+cat("warm-start thresholds:",
+    round(expand_thresholds(opt$par[1], opt$par[2:4]), 4), "\n")
+
+init_warm <- list(t1 = opt$par[1], beta = opt$par[2:4],
+                  bu = rep(0, nU), bi = rep(0, nI),
+                  P = fac$P, Q = fac$Q)
+
+marg5 <- prop.table(tabulate(dat_fit$r, K_LEVELS))
+t_cold <- qlogis(cumsum(marg5)[1:4])
+set.seed(SEED)
+init_cold <- list(t1 = t_cold[1], beta = log(pmax(diff(t_cold), 1e-3)),
+                  bu = rep(0, nU), bi = rep(0, nI),
+                  P = matrix(rnorm(nU * SVD_DIM, 0, 0.05), nU, SVD_DIM),
+                  Q = matrix(rnorm(nI * SVD_DIM, 0, 0.05), nI, SVD_DIM))
+```
+
+---
+
+## 6. Hyperparameter Scan on the Calibration Set
+
+One unified learning rate and one unified L2 for biases and factors
+(supervisor-agreed simplification of the paper's per-type grid; the
+threshold step is the one exception, explained in Section 3). Each
+configuration trains with early stopping on the calibration mean
+log-likelihood and is cached. The test month is not touched.
+
+```{r scan}
+## 6a. Compute pass (slice-aware; trains only this session's share)
+grid <- CJ(eta = ETA_GRID, lambda = LAMBDA_GRID, init = INIT_GRID)
+
+# Failure floor: the marginal predictor's calibration mean log-likelihood.
+# Any configuration that cannot beat it, or that peaks at epoch <= 1
+# (never settled), is not a candidate. marg5 is the fit-set rating
+# distribution from Section 5.
+marg_ll_calib <- mean(log(marg5[dat_calib$r]))
+
+scan_file <- function(g)
+  file.path(CACHE_DIR, sprintf("m2d_scan_eta%g_lam%g_%s.rds",
+                               g$eta, g$lambda, g$init))
+
+rows_mine <- seq(SCAN_SLICE[1], nrow(grid), by = SCAN_SLICE[2])
+cat(sprintf("Grid: %d configurations | this session runs %d (slice %d/%d)\n",
+            nrow(grid), length(rows_mine), SCAN_SLICE[1], SCAN_SLICE[2]))
+cat(sprintf("Marginal-predictor calib meanLL = %.5f (failure floor)\n",
+            marg_ll_calib))
+
+for (k in rows_mine) {
+  g  <- grid[k]
+  cf <- scan_file(g)
+  if (file.exists(cf)) next
+  cat(sprintf("  [%d/%d] eta=%g lambda=%g init=%s ... ",
+              k, nrow(grid), g$eta, g$lambda, g$init))
+  t0 <- Sys.time()
+  r  <- train_ordrec_m2d(dat_fit, dat_calib,
+                         if (g$init == "warm") init_warm else init_cold,
+                         eta = g$eta, lambda = g$lambda, verbose = FALSE)
+  saveRDS(list(best_ll = r$best_ll, best_epoch = r$best_epoch,
+               diverged = r$diverged, history = r$history), cf)
+  cat(sprintf("%.1f min (best epoch %d)\n",
+              as.numeric(difftime(Sys.time(), t0, units = "mins")),
+              r$best_epoch))
+}
+
+## 6b. Assembly (requires every cache file, including other sessions')
+missing <- grid[!vapply(seq_len(nrow(grid)),
+                        function(k) file.exists(scan_file(grid[k])), logical(1))]
+if (nrow(missing)) {
+  print(missing)
+  stop(sprintf("%d configurations missing. Run the remaining slices before assembling.",
+               nrow(missing)))
+}
+
+scan <- rbindlist(lapply(seq_len(nrow(grid)), function(k) {
+  g <- grid[k]; res <- readRDS(scan_file(g))
+  data.table(g,
+    calib_meanLL = res$best_ll,
+    best_epoch   = res$best_epoch,
+    diverged     = res$diverged,
+    # Budget-limited, not converged: early stopping never fired, so the
+    # calibration curve was still rising when MAX_EPOCHS cut it off. Under
+    # a geometric decay the total step budget is proportional to eta, so
+    # this is expected at the small learning rates and such rows are NOT
+    # evidence that the learning rate itself is poor.
+    truncated    = !res$diverged && res$best_epoch >= MAX_EPOCHS,
+    failed       = res$diverged || res$best_epoch <= 1L ||
+                   res$best_ll < marg_ll_calib,
+    clip_rate    = if (nrow(res$history)) max(res$history$clip_rate) else NA)
+}))
+
+kable(scan[order(-calib_meanLL)], digits = 5,
+      caption = "M2d hyperparameter scan, ranked by calibration mean log-likelihood")
+
+best_cfg <- scan[failed == FALSE][which.max(calib_meanLL)]
+cat(sprintf("\nChosen: eta=%g lambda=%g init=%s (calib meanLL %.5f, epoch %d)\n",
+            best_cfg$eta, best_cfg$lambda, best_cfg$init,
+            best_cfg$calib_meanLL, best_cfg$best_epoch))
+
+## 6c. Boundary and truncation checks
+on_edge <- function(v, grid_v)
+  if (v == min(grid_v)) "LOWER BOUNDARY" else
+  if (v == max(grid_v)) "UPPER BOUNDARY" else "interior"
+
+cat(sprintf("  eta    = %g  -> %s of %s\n", best_cfg$eta,
+            on_edge(best_cfg$eta, ETA_GRID),
+            paste(ETA_GRID, collapse = ", ")))
+cat(sprintf("  lambda = %g  -> %s of %s\n", best_cfg$lambda,
+            on_edge(best_cfg$lambda, LAMBDA_GRID),
+            paste(LAMBDA_GRID, collapse = ", ")))
+if (on_edge(best_cfg$eta, ETA_GRID) != "interior" ||
+    on_edge(best_cfg$lambda, LAMBDA_GRID) != "interior")
+  warning("Selected optimum sits on a grid boundary: the grid must be ",
+          "extended in that direction before the value can be reported ",
+          "as an optimum rather than as the best of what was searched.")
+
+n_trunc <- sum(scan$truncated)
+cat(sprintf("\nBudget-limited (best epoch == MAX_EPOCHS = %d): %d of %d configs\n",
+            MAX_EPOCHS, n_trunc, nrow(scan)))
+if (n_trunc) print(scan[truncated == TRUE][order(eta, lambda)])
+```
+
+
+> **Plain read.** Three things to check, in order. **(1)** Is the selected
+> `eta` interior? Until it is, the reported value is the best of what was
+> searched, not an optimum, and the boundary warning says so. **(2)** Are
+> the smallest learning rates flagged `truncated`? Under a geometric decay
+> the total step budget is proportional to `eta`, so a run at 0.003 has one
+> tenth the budget of one at 0.03; if it loses while still improving, it
+> lost on budget rather than on merit, and the write-up says that rather
+> than claiming small rates were tested and rejected. **(3)** Compare the
+> best warm row against the best cold row: if they land at similar
+> calibration likelihoods, the joint optimum is not an artefact of the SVD
+> seeding. Diverged rows should all sit at the largest learning rate —
+> that is the grid doing its job, not a failure.
+
+---
+
+## 7. Final M2d Training
+
+```{r final-train, fig.height=4}
+final_cache <- file.path(CACHE_DIR, "m2d_final.rds")
+if (file.exists(final_cache)) {
+  m2d <- readRDS(final_cache)
+  cat("Loaded cached final M2d.\n")
+} else {
+  m2d <- train_ordrec_m2d(dat_fit, dat_calib,
+                          if (best_cfg$init == "warm") init_warm else init_cold,
+                          eta = best_cfg$eta, lambda = best_cfg$lambda,
+                          verbose = TRUE)
+  saveRDS(m2d, final_cache)
+}
+th_d <- expand_thresholds(m2d$par$t1, m2d$par$beta)
+cat(sprintf("best epoch %d | calib meanLL %.5f | max clip rate %.5f%%\n",
+            m2d$best_epoch, m2d$best_ll, 100 * max(m2d$history$clip_rate)))
+cat("final thresholds:", round(th_d, 4), "\n")
+
+hc <- melt(m2d$history[, .(epoch, fit_meanLL, calib_meanLL)], id.vars = "epoch")
+p_curve <- ggplot(hc, aes(epoch, value, colour = variable)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  geom_vline(xintercept = m2d$best_epoch, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = c(fit_meanLL = "steelblue",
+                                 calib_meanLL = "coral"),
+                      labels = c("fit", "calibration")) +
+  theme_minimal() +
+  labs(title = "M2d training curves",
+       subtitle = "Dashed line: epoch with the best calibration likelihood (parameters kept).",
+       x = "Epoch", y = "Mean log-likelihood", colour = NULL)
+print(p_curve)
+ggsave(file.path(OUT_DIR, "fig9_m2d_training_curve.png"), p_curve,
+       width = 8, height = 4, dpi = 150)
+```
+
+---
+
+## 8. Test-Month Evaluation
+
+Same protocol as 07, one new row.
+
+```{r test-eval}
+P_m2d <- ordrec_probs(m2d$par, dat_test$u, dat_test$i)
+
+P_list <- list(M1 = P_m1, M2a = P_m2a, M2b = P_m2b)
+if (RUN_M2C) P_list$M2c <- P_m2c
+P_list$M2d <- P_m2d
+
+res_list <- lapply(P_list, metric_set, y = test$rating5)
+metrics  <- rbindlist(lapply(names(res_list), function(m)
+  cbind(data.table(model = m), res_list[[m]]$tbl)))
+kable(metrics, digits = 4, caption = "Test month, all models")
+
+rank_tbl <- rbindlist(lapply(names(P_list), function(m) {
+  E <- as.numeric(tidy_probs(P_list[[m]]) %*% LEVELS5)
+  f <- fcp_stat(E, test$rating5, test$userId)
+  data.table(model = m,
+             NDCG10 = ndcg_at_10(E, test$rating5, test$userId),
+             FCP = f$FCP, n_pairs = f$n_pairs, n_users = f$n_users)
+}))
+kable(rank_tbl, digits = 6, caption = "Ranking metrics (users with >= 5 test ratings)")
+```
+
+> **Plain read.** The single most important comparison in this file is the
+> M2d row of the ranking table against the frozen M2a–M2c rows. M1–M2c are
+> identical by algebra; M2d is the first model whose latent scores were
+> allowed to move. Whether NDCG and FCP improve, worsen, or barely move is
+> a result either way and goes in the dissertation as such. The likelihood
+> comparison (meanLL against M2c's -1.2080 territory) answers whether joint
+> training buys anything beyond the two-step shortcut.
+
+### Thresholds across the ladder
+
+```{r thresholds}
+th_tbl <- data.table(model = c("M2a", "M2b", "M2c"[RUN_M2C], "M2d"),
+                     rbind(th_a, th_b,
+                           if (RUN_M2C) m2c_par$Theta, th_d))
+setnames(th_tbl, c("model", paste0(1:4, "|", 2:5)))
+th_long <- melt(th_tbl, id.vars = "model")
+th_wide <- dcast(th_long, model ~ variable)
+gaps <- th_wide[, .(model,
+                    g12 = `2|3` - `1|2`, g23 = `3|4` - `2|3`,
+                    g34 = `4|5` - `3|4`)]
+kable(th_wide, digits = 3, caption = "Thresholds on the latent scale")
+kable(gaps, digits = 3, caption = "Threshold gaps (unequal spacing carries over?)")
+```
+
+> **Plain read.** M2d's latent scale is its own (its scores are trained,
+> not inherited), so absolute threshold values are not comparable across
+> rows — the *pattern of gaps* is. If the 4|5 gap remains the widest, the
+> unequal-spacing finding survives joint training.
+
+---
+
+## 9. Cluster Bootstrap
+
+Users resampled with replacement, as in 07. Comparisons against M1, plus
+M2d against M2c — the question of whether joint training beats the
+two-step random-intercept model.
+
+```{r bootstrap, fig.height=3.6}
+ll_mat <- do.call(cbind, lapply(res_list, function(r) r$row_ll))
+colnames(ll_mat) <- names(res_list)
+
+rows_by_user <- split(seq_len(nrow(test)), test$userId)
+u_names <- names(rows_by_user)
+
+set.seed(SEED)
+others <- setdiff(colnames(ll_mat), "M1")
+cmp_names <- c(paste0(others, " - M1"), if (RUN_M2C) "M2d - M2c")
+boot <- matrix(NA_real_, N_BOOT, length(cmp_names),
+               dimnames = list(NULL, cmp_names))
+for (b in seq_len(N_BOOT)) {
+  idx <- unlist(rows_by_user[sample(u_names, length(u_names), replace = TRUE)],
+                use.names = FALSE)
+  mm  <- colMeans(ll_mat[idx, , drop = FALSE])
+  boot[b, ] <- c(mm[others] - mm["M1"],
+                 if (RUN_M2C) mm["M2d"] - mm["M2c"])
+}
+obs <- colMeans(ll_mat)
+obs_diff <- c(obs[others] - obs["M1"],
+              if (RUN_M2C) obs["M2d"] - obs["M2c"])
+ci <- data.table(comparison  = colnames(boot),
+                 diff_meanLL = as.numeric(obs_diff),
+                 lo = apply(boot, 2, quantile, 0.025, na.rm = TRUE),
+                 hi = apply(boot, 2, quantile, 0.975, na.rm = TRUE))
+ci[, significant := (lo > 0) | (hi < 0)]
+kable(ci, digits = 5,
+      caption = sprintf("Cluster bootstrap, %d replicates, users resampled", N_BOOT))
+
+p_ci <- ggplot(ci, aes(comparison, diff_meanLL)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), colour = "steelblue") +
+  coord_flip() + theme_minimal() +
+  labs(title = "Gain in mean log-likelihood",
+       subtitle = "95% cluster bootstrap intervals",
+       x = NULL, y = "Difference in mean log-likelihood")
+print(p_ci)
+ggsave(file.path(OUT_DIR, "fig10_m2d_bootstrap.png"), p_ci,
+       width = 7, height = 3.6, dpi = 150)
+```
+
+---
+
+## 10. Save Everything
+
+```{r save}
+fwrite(metrics,  file.path(OUT_DIR, "m2d_test_metrics.csv"))
+fwrite(rank_tbl, file.path(OUT_DIR, "m2d_ranking_metrics.csv"))
+fwrite(ci,       file.path(OUT_DIR, "m2d_bootstrap_ci.csv"))
+fwrite(th_wide,  file.path(OUT_DIR, "m2d_thresholds.csv"))
+fwrite(scan,     file.path(OUT_DIR, "m2d_hyperparameter_scan.csv"))
+
+saveRDS(list(best_cfg = best_cfg, thresholds = th_d,
+             calib_meanLL = m2d$best_ll, best_epoch = m2d$best_epoch,
+             metrics = metrics, ranking = rank_tbl, ci = ci,
+             sigma_m1 = sigma_m1),
+        file.path(CACHE_DIR, "m2d_results.rds"))
+cat("Written to", OUT_DIR, "\n")
+```
+
+---
+
+## 11. What Is Not Here
+
+1. **M2e** (per-user thresholds, no $b_u$ — the configuration the paper
+   itself uses, their eq. 13). Next file; it reuses this trainer with a
+   per-user threshold index and drops the user bias.
+2. **Per-parameter-type learning-rate grids** (paper Section 6.1). One
+   unified rate here by design; revisit only if M2d underperforms M2c.
+3. **The identifiability note for the write-up**: with global thresholds a
+   constant can be added to every $b_i$ and every threshold without
+   changing the likelihood; the L2 penalty pins this down. In M2e the
+   same argument removes $b_u$ entirely.
+
+## References
+
+Koren, Y. and Sill, J. (2011) OrdRec: an ordinal model for predicting
+personalized item rating distributions. *RecSys '11*, pp. 117–124.
+
+McCullagh, P. (1980) Regression models for ordinal data. *JRSS-B*, 42(2),
+pp. 109–142.
