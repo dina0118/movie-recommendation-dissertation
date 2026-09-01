@@ -17,53 +17,6 @@ library(data.table)
 library(ggplot2)
 library(knitr)
 ```
-
-## Aim
-
-M2e is the paper's configuration and the end of the ordinal ladder. M3
-asks the question Koren and Sill leave open in their final paragraph:
-whether *item attributes for rarely rated items* add anything on top of
-it. Two models are trained, both cold-start, both with M2e's
-hyperparameters:
-
-$$\text{M3a:}\quad y_{ui} = b_i + w^\top c_i + q_i^\top p_u$$
-$$\text{M3b:}\quad y_{ui} = b_i + w^\top c_i + \big(q_i + W^\top c_i\big)^\top p_u$$
-
-with $c_i$ the standardised content vector from `05b`. Everything else —
-the logit link, the per-user thresholds $t^{(u)}$, the likelihood, the
-mini-batch trainer — is M2e's, unchanged.
-
-**What M3a actually does, and why it is not vacuous.** Every film already
-has a free bias $b_i$, so $w^\top c_i$ adds *no capacity*: with $b_i$
-unpenalised the two models would be exactly equivalent. The content term
-acts only through the penalty. Because $b_i$ is shrunk toward zero and
-the film's total bias is $b_i + w^\top c_i$, the effect of the content
-term is to move the **shrinkage target** from the global mean to a
-content-predicted value. M3a is therefore a feature-based prior on the
-item bias, in the sense of Agarwal and Chen's RLFM, whose MovieLens-100K
-result — a test set with no new users or items, where the entire gain
-came from "better regularization achieved through feature-based prior" —
-is the closest published analogue to this setup. M3b extends the same
-logic from the bias to the factor, as in Wang and Blei's
-$v_j = \theta_j + \epsilon_j$.
-
-**The prediction being tested.** Shrinkage matters most where the data is
-thinnest, so the gain should decay monotonically with item support. Strub
-et al. report exactly this on MovieLens-10M: an RMSE improvement of
-1.811% in the sparsest quintile of items falling to 0.052% in the
-densest, with only 0.206% overall. Pilászy and Tikk locate the crossover
-at roughly ten ratings — and this selection prunes at $N_m \ge 10$, so
-**the whole catalogue sits on the side where ratings already dominate
-metadata.** The pre-registered expectation is therefore a small or
-zero overall gain with a monotone decay across strata. The stratified
-contrast, not the headline number, is the result.
-
-**Trust chain.** The likelihood/gradient core is M2e's, which passed the
-numerical check in 08 and the `clm` cross-check in 07. The two new
-gradient blocks ($w$, $W$) get their own numerical check in Section 4,
-and the trainer is re-run through M2e's synthetic self-test with the
-content term switched off, which must reproduce M2e's behaviour.
-
 ---
 
 ## 0. Settings
@@ -159,11 +112,6 @@ stopifnot(identical(support$movie_idx, seq_len(nI)))
 ---
 
 ## 2. Core Functions
-
-Metric functions are verbatim from 07/09/10 so the evaluation protocol
-stays bit-identical across the whole ladder. The scoring functions are
-M2e's with the content term added; setting `W = NULL` and `w = 0`
-recovers M2e exactly, which is what the self-test in Section 4 exploits.
 
 ```{r core-functions}
 sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
@@ -262,23 +210,6 @@ fcp_stat <- function(score, y, uid, min_items = 5L) {
 
 ## 3. The Trainer
 
-M2e's trainer with two new parameter blocks. Three decisions carry over
-from 09/10 and one is new:
-
-- **Per-user thresholds, $b_i$, $P$, $Q$**: batch-SUM gradient with
-  per-occurrence L2, exactly as in 10. These are entity parameters,
-  touched by only some rows of a batch.
-- **$w$ and $W$ are global parameters**, touched by *every* row of every
-  batch, like the four global thresholds in 09. They therefore take the
-  batch-MEAN gradient and a plain (not per-occurrence) L2 at
-  `lambda_c`. Using the sum here would make their effective learning
-  rate scale with batch size.
-- **$q_i$ is penalised toward zero, not toward $W^\top c_i$.** That is
-  the whole mechanism: the total item factor is $q_i + W^\top c_i$, so
-  shrinking the residual $q_i$ pulls the total toward the content
-  prediction. Same for $b_i$ against $w^\top c_i$.
-- Clipping, learning-rate decay and early stopping on calibration
-  meanLL are unchanged.
 
 ```{r trainer}
 train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
@@ -377,10 +308,6 @@ train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
 
 ### 4a. Numerical gradient check on the two new blocks
 
-The analytic gradients for $w$ and $W$ are the only genuinely new algebra
-in this file, so they are checked against finite differences on a small
-synthetic problem before anything is trained.
-
 ```{r grad-check}
 set.seed(11)
 .nU <- 40L; .nI <- 30L; .K <- 4L; .nF <- 6L; .n <- 500L
@@ -431,10 +358,6 @@ rm(.p, .d, .g, .num_w, .num_W, .Csave)
 
 ### 4b. Reduction check: content off must reproduce M2e
 
-With `w = 0`, `W = NULL` and `lambda_c` irrelevant, the trainer's update
-equations reduce to 10's line for line. Running it from M2e's own
-cold-start initialisation and the same seed must land on the same
-calibration likelihood.
 
 ```{r reduction-check}
 m2e <- readRDS(file.path(CACHE_M12, "m2e_final.rds"))
@@ -477,10 +400,6 @@ cat("REDUCTION CHECK: PASS\n")
 
 ## 5. Selecting `lambda_c` on Calibration
 
-M2e's `lambda` stays at 0.02 throughout. Only the content block's penalty
-is scanned, on the calibration set, as libFM's grouped regularisation
-argument prescribes. The scan is run for M3a; M3b reuses the selected
-value so the M3a/M3b contrast is not confounded by a second search.
 
 ```{r lambda-scan}
 scan_cache <- file.path(CACHE_M3, "m3a_lambda_scan.rds")
@@ -573,18 +492,6 @@ kable(metrics, digits = 5, caption = "Test month (2018-10)")
 
 ## 8. The Result: Paired Contrasts, Stratified by Item Support
 
-Two decisions here decide whether the analysis can see anything at all.
-
-**Paired, not marginal.** The quantity of interest is the per-row
-difference $\Delta_{ui} = \ell^{M3}_{ui} - \ell^{M2e}_{ui}$, resampled as
-a difference. Comparing two separately-resampled marginal means would
-carry the between-row variance of the likelihood itself, which is orders
-of magnitude larger than the effect being measured and would swamp it.
-
-**Two-way bootstrap.** Test rows are crossed by user and by item, not
-independent, so the resampling weights both margins by the product of
-independent draw counts, as in file 20 (Owen and Eckles).
-
 ```{r paired-boot}
 LLm <- sapply(P_list, function(P) log(tidy_probs(P)[cbind(seq_len(nrow(P)), test$rating5)]))
 D <- data.table(d_a = LLm[, "M3a"] - LLm[, "M2e"],
@@ -653,22 +560,9 @@ ggsave(file.path(OUT_DIR, "m3d_support_decay.png"), p_decay,
        width = 8, height = 4.2, dpi = 150)
 ```
 
-> **Plain read.** The `All` row is the headline and is expected to be
-> small. The pattern across the four strata is the result. A monotone
-> decline confirms the shrinkage account and reproduces Strub et al.'s
-> quintile pattern under an ordinal likelihood rather than RMSE; a flat
-> profile would falsify it and would need explaining — the first thing to
-> check would be the feature/support correlations written out by `05b`,
-> since a content-composition difference between strata would produce a
-> gain that does not come from sparsity at all.
-
 ---
 
 ## 9. Where the Content Term Puts Its Weight
-
-Which blocks earn their parameters. This is descriptive, not inferential:
-the coefficients are penalised and correlated, so they are read as
-"where the model chose to spend capacity", not as effect estimates.
 
 ```{r block-weights}
 wt <- data.table(feature = colnames(Cmat), block = feat$block,
@@ -711,26 +605,3 @@ saveRDS(m3_results, file.path(CACHE_M3, "m3_results.rds"))
 fwrite(metrics, file.path(OUT_DIR, "m3_vs_m2e_comparison.csv"))
 cat("06b COMPLETE.\n")
 ```
-
----
-
-## 11. Limitations Specific to M3
-
-- **The content term is collinear with $b_i$ and $q_i$ by construction.**
-  Any gain is a regularisation effect, not new capacity. This is the
-  intended mechanism, but it means M3 cannot be described as "adding
-  information the model did not have"; it re-aims the shrinkage.
-- **`lambda_c` is tuned but M2e's `lambda` is not re-tuned alongside it.**
-  A joint scan might find a different optimum for the pair. The
-  single-axis scan is the price of keeping the M2e comparison clean.
-- **The sparsest stratum here is 10–20 ratings**, because the selection
-  prunes at $N_m \ge 10$. Pilászy and Tikk place the ratings-vs-metadata
-  crossover at about ten ratings, so this design cannot observe the
-  regime where content is predicted to dominate. That is what the
-  Phase B reselection at lower $N_m$ is for, and this limitation is the
-  reason it is not optional.
-- **Text features are a TF-IDF/SVD bag of words.** Kim et al. report that
-  bag-of-words item models add almost nothing over plain MF on dense
-  MovieLens (CTR 0.8969 vs PMF 0.8971 on ML-1m) and attribute this to the
-  loss of word order. A contextual encoder might do better; that is out
-  of scope.
