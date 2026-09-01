@@ -1,16 +1,6 @@
 # =====================================================================
 # 05c_M3_features_v8.R
 # Phase B, step 2: rebuild the content features for the v8 movie set.
-#
-# Same four blocks and the same exclusions as 05b. It is a separate file
-# rather than an edit to 05b because 05b's guards (fit == 393,364 rows,
-# min support >= 10) are correct for v7 and must keep firing there.
-#
-# The overview TF-IDF/SVD is REFITTED on the v8 catalogue. The v8 film
-# set is several times larger, so reusing v7's rotation would give the
-# new tail films coordinates in a space defined without them.
-#
-# Runtime: ~5-10 minutes (TF-IDF over a larger catalogue).
 # =====================================================================
 
 FEATURE_VERSION <- "v8"
