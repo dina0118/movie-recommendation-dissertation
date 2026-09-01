@@ -1,0 +1,678 @@
+---
+title: "M2e Analysis: Confidence, Calibration, and Dissertation Figures (M1–M2e)"
+author: "Dina Muhamaitihan | Movie Recommendation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+  pdf_document:
+    toc: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7.5, fig.height = 4.2, dpi = 150)
+library(data.table)
+library(ggplot2)
+library(ordinal)
+library(knitr)
+```
+
+
+
+## 0. Settings
+
+```{r config}
+# --- edit these three paths (same as 07/09/10) ------------------------
+SEL_FILE  <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/00_data_selection/selection_v7_2018-04_6m_Nu10_Nm10.rds"
+OUT_DIR   <- "D:/桌面/movie-recommendation-dissertation/06_models/output/07_M1_M2"
+CACHE_DIR <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/07_M1_M2"
+# ----------------------------------------------------------------------
+
+FIG_DIR <- file.path(OUT_DIR, "figs_dissertation")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+SEED     <- 2024L
+SVD_DIM  <- 16L
+K_LEVELS <- 5L
+LEVELS5  <- 1:5
+CUTS     <- c(1.5, 2.5, 3.5, 4.5)
+N_BOOT   <- 500L
+
+set.seed(SEED)
+
+# ---- one visual identity for every dissertation figure ---------------
+# Okabe-Ito palette (colour-blind safe); models keep the same colour
+# in every figure so the reader learns the mapping once.
+MODEL_LEVELS <- c("M1", "M2a", "M2b", "M2c", "M2d", "M2e")
+MODEL_COLS <- c(M1 = "#7F7F7F", M2a = "#56B4E9", M2b = "#0072B2",
+                M2c = "#009E73", M2d = "#E69F00", M2e = "#D55E00")
+theme_pub <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(size = base_size, face = "plain"),
+          legend.position = "bottom",
+          plot.margin = margin(t = 8, r = 16, b = 8, l = 8))
+}
+
+save_fig <- function(name, plot, w = 6.5, h = 4.0) {
+  plot <- plot + labs(subtitle = NULL, caption = NULL)
+  ggsave(file.path(FIG_DIR, name), plot,
+         width = w, height = h, units = "in", dpi = 300, bg = "white")
+  invisible(plot)
+}
+```
+
+------------------------------------------------------------------------
+
+## 1. Load the Selection and All Cached Models
+
+```{r load-data}
+sel   <- readRDS(SEL_FILE)
+fit   <- as.data.table(sel$fit)
+calib <- as.data.table(sel$calib)
+test  <- as.data.table(sel$test)
+
+to_int5 <- function(d) { d[, rating5 := as.integer(as.character(rating5))]; d[] }
+fit <- to_int5(fit); calib <- to_int5(calib); test <- to_int5(test)
+
+user_map  <- data.table(userId  = sort(unique(fit$userId)))[,  user_idx  := .I]
+movie_map <- data.table(movieId = sort(unique(fit$movieId)))[, movie_idx := .I]
+add_idx <- function(d) {
+  d <- merge(d, user_map,  by = "userId",  all.x = TRUE, sort = FALSE)
+  d <- merge(d, movie_map, by = "movieId", all.x = TRUE, sort = FALSE)
+  setDT(d)
+  d[, cold := is.na(user_idx) | is.na(movie_idx)]
+  d[]
+}
+fit   <- add_idx(fit)[cold == FALSE]
+calib <- add_idx(calib)[cold == FALSE]
+test  <- add_idx(test)[cold == FALSE]
+
+nU <- nrow(user_map); nI <- nrow(movie_map)
+stopifnot(nrow(fit) == 393364L)
+
+svd_cache <- readRDS(file.path(CACHE_DIR, "svd_factors.rds"))
+stopifnot(identical(as.integer(svd_cache$user_map$userId),   as.integer(user_map$userId)),
+          identical(as.integer(svd_cache$movie_map$movieId), as.integer(movie_map$movieId)),
+          svd_cache$dim == SVD_DIM)
+Pmat <- svd_cache$P; Qmat <- svd_cache$Q
+
+m2c_par <- readRDS(file.path(CACHE_DIR, "m2c_params.rds"))
+m2d <- readRDS(file.path(CACHE_DIR, "m2d_final.rds"))
+stopifnot(abs(m2d$best_ll - (-1.10002)) < 2e-4)   # stale-cache guard, as in 10
+m2e <- readRDS(file.path(CACHE_DIR, "m2e_final.rds"))
+cat(sprintf("M2d best epoch %d (calib %.5f) | M2e best epoch %d (calib %.5f)\n",
+            m2d$best_epoch, m2d$best_ll, m2e$best_epoch, m2e$best_ll))
+```
+
+------------------------------------------------------------------------
+
+## 2. Rebuild the Six Predictive Matrices
+
+
+
+```{r core-functions}
+sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
+expand_thresholds <- function(t1, beta) c(t1, t1 + cumsum(exp(beta)))
+tidy_probs <- function(P) { P <- pmax(P, 1e-12); P / rowSums(P) }
+
+gauss_probs <- function(y, sigma) {
+  y  <- as.numeric(y)
+  CP <- sapply(CUTS, function(c) pnorm((c - y) / sigma))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(y))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+cum_probs <- function(theta, eta) {
+  eta <- as.numeric(eta)
+  CP  <- sapply(theta, function(t) plogis(t - eta))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(eta))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+calc_scores_d <- function(par, u, i)
+  par$bi[i] + par$bu[u] + rowSums(par$P[u, , drop = FALSE] * par$Q[i, , drop = FALSE])
+ordrec_probs_d <- function(par, u, i) {
+  y  <- calc_scores_d(par, u, i)
+  th <- expand_thresholds(par$t1, par$beta)
+  CP <- sapply(th, function(t) plogis(t - y))
+  if (is.null(dim(CP))) CP <- matrix(CP, nrow = length(y))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+calc_scores_e <- function(par, u, i)
+  par$bi[i] + rowSums(par$P[u, , drop = FALSE] * par$Q[i, , drop = FALSE])
+user_threshold_rows <- function(par, u) {
+  E <- exp(par$beta[u, , drop = FALSE]); t1 <- par$t1[u]
+  cbind(t1, t1 + E[, 1], t1 + E[, 1] + E[, 2], t1 + E[, 1] + E[, 2] + E[, 3])
+}
+ordrec_probs_e <- function(par, u, i) {
+  y  <- calc_scores_e(par, u, i)
+  CP <- plogis(user_threshold_rows(par, u) - y)
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+metric_set <- function(P, y) {
+  y   <- as.integer(y); P <- tidy_probs(P); n <- nrow(P)
+  ll  <- log(P[cbind(seq_len(n), y)])
+  E   <- as.numeric(P %*% LEVELS5)
+  CP  <- t(apply(P, 1, cumsum))
+  IND <- outer(y, LEVELS5, function(a, b) as.numeric(a <= b))
+  rps <- rowSums((CP[, 1:(K_LEVELS - 1)] - IND[, 1:(K_LEVELS - 1)])^2) / (K_LEVELS - 1)
+  list(row_ll = ll,
+       tbl = data.table(meanLL = mean(ll),
+                        RMSE   = sqrt(mean((y - E)^2)),
+                        RPS    = mean(rps),
+                        CatAcc = mean(max.col(P, ties.method = "first") == y)))
+}
+ndcg_per_user <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), rel = 2^as.integer(y) - 1)
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  d[, {
+    k    <- min(10L, .N)
+    dcg  <- sum(rel[order(-s)][1:k]   / log2(seq_len(k) + 1))
+    idcg <- sum(rel[order(-rel)][1:k] / log2(seq_len(k) + 1))
+    .(ndcg = if (idcg > 0) dcg / idcg else NA_real_)
+  }, by = uid]
+}
+fcp_stat <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), y = as.integer(y))
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  per_user <- d[, {
+    sy_gt <- outer(y, y, `>`); sy_lt <- outer(y, y, `<`)
+    ss_gt <- outer(s, s, `>`); ss_ge <- outer(s, s, `>=`)
+    list(nc = sum(ss_gt & sy_gt), nd = sum(ss_ge & sy_lt))
+  }, by = uid]
+  nc <- sum(per_user$nc); nd <- sum(per_user$nd)
+  list(FCP = nc / (nc + nd), n_pairs = nc + nd, n_users = uniqueN(d$uid))
+}
+```
+
+```{r rebuild-models}
+svd_score_vec <- function(u, i)
+  rowSums(Pmat[u, , drop = FALSE] * Qmat[i, , drop = FALSE])
+calib[, svd_score := svd_score_vec(user_idx, movie_idx)]
+test[,  svd_score := svd_score_vec(user_idx, movie_idx)]
+calib[, svd_clip := pmin(pmax(svd_score, 1), 5)]
+test[,  svd_clip := pmin(pmax(svd_score, 1), 5)]
+
+sigma_m1 <- sqrt(mean((as.numeric(calib$rating5) - calib$svd_clip)^2))
+P_m1 <- gauss_probs(test$svd_clip, sigma_m1)
+
+calib[, rating_f := factor(rating5, levels = LEVELS5, ordered = TRUE)]
+m2a <- clm(rating_f ~ svd_score, data = calib, link = "logit",
+           threshold = "equidistant")
+m2b <- clm(rating_f ~ svd_score, data = calib, link = "logit",
+           threshold = "flexible")
+th_a <- as.numeric(m2a$alpha); b_a <- as.numeric(m2a$beta)
+th_a <- th_a[1] + (0:3) * th_a[2]
+th_b <- as.numeric(m2b$alpha); b_b <- as.numeric(m2b$beta)
+P_m2a <- cum_probs(th_a, b_a * test$svd_score)
+P_m2b <- cum_probs(th_b, b_b * test$svd_score)
+
+bu_c <- m2c_par$ranef[as.character(test$userId)]
+bu_c[is.na(bu_c)] <- 0
+P_m2c <- cum_probs(m2c_par$Theta, m2c_par$beta * test$svd_score + as.numeric(bu_c))
+
+th_d  <- expand_thresholds(m2d$par$t1, m2d$par$beta)
+P_m2d <- ordrec_probs_d(m2d$par, test$user_idx, test$movie_idx)
+P_m2e <- ordrec_probs_e(m2e$par, test$user_idx, test$movie_idx)
+
+P_list <- list(M1 = P_m1, M2a = P_m2a, M2b = P_m2b,
+               M2c = P_m2c, M2d = P_m2d, M2e = P_m2e)
+res_list <- lapply(P_list, metric_set, y = test$rating5)
+```
+
+------------------------------------------------------------------------
+
+## 3. Tables
+
+```{r master-table}
+metrics <- rbindlist(lapply(names(res_list), function(m)
+  cbind(data.table(model = m), res_list[[m]]$tbl)))
+rank_tbl <- rbindlist(lapply(names(P_list), function(m) {
+  E <- as.numeric(tidy_probs(P_list[[m]]) %*% LEVELS5)
+  f <- fcp_stat(E, test$rating5, test$userId)
+  data.table(model = m,
+             NDCG10 = mean(ndcg_per_user(E, test$rating5, test$userId)$ndcg,
+                           na.rm = TRUE),
+             FCP = f$FCP)
+}))
+master <- merge(metrics, rank_tbl, by = "model")[
+  order(match(model, MODEL_LEVELS))]
+kable(master, digits = 4, caption = "Test month, all six models, all six metrics")
+fwrite(master, file.path(OUT_DIR, "ladder_master_table.csv"))
+
+# guard: this file must reproduce 10's numbers exactly
+stopifnot(abs(master[model == "M2e", meanLL] - (-1.154440)) < 1e-4,
+          abs(master[model == "M2d", meanLL] - (-1.185765)) < 1e-4)
+
+# fit-calib gaps at the kept epoch, for the overfitting discussion
+gap_tbl <- data.table(
+  model = c("M2d", "M2e"),
+  best_epoch = c(m2d$best_epoch, m2e$best_epoch),
+  fit_calib_gap = c(m2d$history[epoch == m2d$best_epoch, fit_meanLL - calib_meanLL],
+                    m2e$history[epoch == m2e$best_epoch, fit_meanLL - calib_meanLL]))
+kable(gap_tbl, digits = 4, caption = "Fit-calibration gap at the kept epoch")
+fwrite(gap_tbl, file.path(OUT_DIR, "m2de_fitcalib_gaps.csv"))
+```
+
+------------------------------------------------------------------------
+
+## 4. Cluster Bootstrap 
+
+```{r bootstrap}
+ll_mat <- do.call(cbind, lapply(res_list, function(r) r$row_ll))
+colnames(ll_mat) <- names(res_list)
+rows_by_user <- split(seq_len(nrow(test)), test$userId)
+u_names <- names(rows_by_user)
+
+set.seed(SEED)
+others <- setdiff(colnames(ll_mat), "M1")
+cmp_names <- c(paste0(others, " - M1"), "M2d - M2c", "M2e - M2d")
+boot <- matrix(NA_real_, N_BOOT, length(cmp_names),
+               dimnames = list(NULL, cmp_names))
+for (b in seq_len(N_BOOT)) {
+  idx <- unlist(rows_by_user[sample(u_names, length(u_names), replace = TRUE)],
+                use.names = FALSE)
+  mm  <- colMeans(ll_mat[idx, , drop = FALSE])
+  boot[b, ] <- c(mm[others] - mm["M1"], mm["M2d"] - mm["M2c"],
+                 mm["M2e"] - mm["M2d"])
+}
+obs <- colMeans(ll_mat)
+obs_diff <- c(obs[others] - obs["M1"], obs["M2d"] - obs["M2c"],
+              obs["M2e"] - obs["M2d"])
+ci <- data.table(comparison  = colnames(boot),
+                 diff_meanLL = as.numeric(obs_diff),
+                 lo = apply(boot, 2, quantile, 0.025),
+                 hi = apply(boot, 2, quantile, 0.975))
+ci[, significant := (lo > 0) | (hi < 0)]
+kable(ci, digits = 5, caption = "Cluster bootstrap (users resampled, 500 reps)")
+```
+
+------------------------------------------------------------------------
+
+## 5. Figures
+
+
+
+### 5.1 The ladder with uncertainty 
+
+```{r p1-ladder, fig.height=3.8}
+lad <- ci[grepl(" - M1$", comparison)]
+lad[, model := factor(sub(" - M1$", "", comparison), levels = MODEL_LEVELS)]
+p1 <- ggplot(lad, aes(model, diff_meanLL)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), linewidth = 0.7, size = 0.5,
+                  colour = "#D55E00") +
+  theme_pub() +
+  labs(title = "Gain in test mean log-likelihood over M1, by model", 
+       x = NULL, y = "Gain in mean log-likelihood over M1")
+print(p1)
+save_fig("p01_ladder_meanLL_ci.png", p1, w = 6.5, h = 3.8)
+```
+
+### 5.2 Where the gains come from: incremental waterfall 
+
+```{r p2-waterfall, fig.height=3.8}
+step_lab <- c("M1 \u2192 M2a\nordinal link",
+              "M2a \u2192 M2b\nfree spacing",
+              "M2b \u2192 M2c\nuser intercept",
+              "M2c \u2192 M2d\njoint training",
+              "M2d \u2192 M2e\nper-user thresholds")
+mm <- master[match(MODEL_LEVELS, model), meanLL]
+wf <- data.table(step = factor(step_lab, levels = step_lab),
+                 gain = diff(mm),
+                 to_model = MODEL_LEVELS[-1])
+p2 <- ggplot(wf, aes(step, gain, fill = to_model)) +
+  geom_col(width = 0.62) +
+  geom_text(aes(label = sprintf("+%.4f", gain)), vjust = -0.45, size = 3.1) +
+  scale_fill_manual(values = MODEL_COLS, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14))) +
+  theme_pub() +
+  labs(title = "Incremental gain of each rung of the ladder",
+       subtitle = "Test-month mean log-likelihood.\nThe two joint-training steps (M2d, M2e) contribute more than the three frozen-factor steps combined.",
+       x = NULL, y = expression(Delta * " mean log-likelihood"))
+print(p2)
+save_fig("p02_incremental_waterfall.png", p2, w = 7.6, h = 4.0)
+```
+
+### 5.3 Likelihood vs ranking: two different kinds of gain 
+
+```{r p3-decomposition, fig.height=4.0}
+nd <- master[match(MODEL_LEVELS, model), NDCG10]
+dec <- rbind(
+  data.table(step = factor(step_lab, levels = step_lab),
+             metric = "\u0394 mean log-likelihood", value = diff(mm),
+             to_model = MODEL_LEVELS[-1]),
+  data.table(step = factor(step_lab, levels = step_lab),
+             metric = "\u0394 NDCG@10", value = diff(nd),
+             to_model = MODEL_LEVELS[-1]))
+p3 <- ggplot(dec, aes(step, value, fill = to_model)) +
+  geom_col(width = 0.62) +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = MODEL_COLS, guide = "none") +
+  theme_pub() +
+  theme(axis.text.x = element_text(size = 8)) +
+  labs(title = "Calibration gains vs. ranking gains are carried by different steps",
+       subtitle = "Frozen-factor steps (M2a-M2c) cannot move NDCG (identical scores by algebra).\nJoint training (M2d) moves ranking most; per-user thresholds (M2e) move likelihood most.",
+       x = NULL, y = NULL)
+print(p3)
+save_fig("p03_likelihood_vs_ranking.png", p3, w = 6.8, h = 4.6)
+```
+
+### 5.4 The RMSE decoupling story 
+
+```{r p4-decoupling, fig.height=4.0}
+dc <- master[, .(model, RMSE, meanLL)]
+dc[, model := factor(model, levels = MODEL_LEVELS)]
+setorder(dc, model)
+p4 <- ggplot(dc, aes(RMSE, meanLL)) +
+  geom_path(colour = "grey65", linewidth = 0.5,
+            arrow = arrow(length = unit(5, "pt"), type = "closed")) +
+  geom_point(aes(colour = model), size = 2.6) +
+  geom_text(aes(label = model, colour = model),
+            vjust = -0.9, size = 3.2, show.legend = FALSE) +
+  scale_colour_manual(values = MODEL_COLS, guide = "none") +
+  scale_x_reverse(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.08)) +
+  theme_pub() +
+  labs(title = "Ordinalisation first sacrifices RMSE, joint training wins it back",
+       subtitle = "Path follows the ladder. M2a/M2b trade RMSE for likelihood; M2d/M2e beat M1 on both,\nechoing Koren & Sill's Netflix result. x-axis reversed: right = better.",
+       x = "RMSE (reversed: right = better)", y = "Mean log-likelihood (up = better)")
+print(p4)
+save_fig("p04_rmse_decoupling.png", p4, w = 7.2, h = 4.6)
+```
+
+### 5.5 Threshold spacing across the ladder
+
+
+```{r p5-spacing, fig.height=3.6}
+Tall <- user_threshold_rows(m2e$par, seq_len(nU))
+gaps_e <- data.table(user_idx = seq_len(nU),
+                     g12 = Tall[, 2] - Tall[, 1],
+                     g23 = Tall[, 3] - Tall[, 2],
+                     g34 = Tall[, 4] - Tall[, 3])
+lv_used <- fit[, .(n_lv = uniqueN(rating5)), by = user_idx]
+gaps_fs <- gaps_e[lv_used[n_lv == 5L], on = "user_idx"]
+cat(sprintf("fully-identified users: %d / %d (%.1f%%)\n",
+            nrow(gaps_fs), nU, 100 * nrow(gaps_fs) / nU))
+
+sp <- rbind(
+  data.table(model = "M2b", gap = c("1|2\u21922|3", "2|3\u21923|4", "3|4\u21924|5"),
+             width = diff(th_b)),
+  data.table(model = "M2c", gap = c("1|2\u21922|3", "2|3\u21923|4", "3|4\u21924|5"),
+             width = diff(m2c_par$Theta)),
+  data.table(model = "M2d", gap = c("1|2\u21922|3", "2|3\u21923|4", "3|4\u21924|5"),
+             width = diff(th_d)),
+  data.table(model = "M2e*", gap = c("1|2\u21922|3", "2|3\u21923|4", "3|4\u21924|5"),
+             width = c(median(gaps_fs$g12), median(gaps_fs$g23), median(gaps_fs$g34))))
+sp[, share := width / sum(width), by = model]
+sp[, model := factor(model, levels = c("M2b", "M2c", "M2d", "M2e*"))]
+p5 <- ggplot(sp, aes(model, share, fill = gap)) +
+  geom_col(width = 0.6, colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", share)),
+            position = position_stack(vjust = 0.5), size = 3, colour = "white") +
+  scale_fill_manual(values = c("#88BDE6", "#5B8FF9", "#1F5FA8")) +
+  theme_pub() +
+  labs(title = "Unequal threshold spacing survives four estimation routes",
+       subtitle = "Share of the total latent span taken by each gap. The 3|4\u21924|5 gap is widest everywhere.\nM2e*: median over the 1,759 users who used all five rating levels (fully identified thresholds).",
+       x = NULL, y = "Share of total span", fill = "Gap")
+print(p5)
+save_fig("p05_threshold_spacing.png", p5, w = 6.3, h = 3.8)
+```
+
+### 5.6 How much users disagree: per-user gap distributions 
+
+```{r p6-gapdist, fig.height=3.6}
+gd_stats <- gd_long[, .(median = median(width), q25 = quantile(width, 0.25),
+                         q75 = quantile(width, 0.75)), by = gap]
+p6_d <- ggplot(gd_long, aes(gap, width)) +
+  geom_jitter(width = 0.08, height = 0, size = 0.7, alpha = 0.15, colour = "#D55E00") +
+  geom_crossbar(data = gd_stats, aes(y = median, ymin = q25, ymax = q75),
+                width = 0.35, fill = NA, colour = "#D55E00", linewidth = 0.6) +
+  geom_point(data = ref_d, aes(gap, width), shape = 17, size = 3.5,
+             colour = "#E69F00") +
+  theme_pub() +
+  labs(title = "Per-user threshold gaps: empirical distribution and summary",
+       subtitle = "Points: individual users (jittered); thick bar: IQR; triangle: M2d's global reference.",
+       x = NULL, y = "Gap width on the latent scale")
+print(p6_d)
+save_fig("p06_gap_distributions_strip.png", p6_d, w = 6.3, h = 3.6)
+```
+
+### 5.7 What personalised distributions look like
+
+
+```{r p7-examples, fig.height=3.4}
+um <- fit[, .(mean_r = mean(rating5)), by = user_idx]
+um <- um[user_idx %in% unique(test$user_idx)][order(mean_r)]
+pick_u <- um[round(nrow(um) * c(0.10, 0.50, 0.90)), user_idx]
+rows <- sapply(pick_u, function(u) which(test$user_idx == u)[1])
+
+ex <- rbindlist(lapply(seq_along(rows), function(k) {
+  j <- rows[k]
+  rbind(data.table(case = k, model = "M1",  rating = LEVELS5,
+                   prob = tidy_probs(P_m1)[j, ]),
+        data.table(case = k, model = "M2e", rating = LEVELS5,
+                   prob = tidy_probs(P_m2e)[j, ]))
+}))
+case_lab <- sapply(seq_along(rows), function(k)
+  sprintf("user mean %.2f | true rating %d",
+          um[user_idx == pick_u[k], mean_r], test$rating5[rows[k]]))
+ex[, case := factor(case, labels = case_lab)]
+truth <- data.table(case = factor(seq_along(rows), labels = case_lab),
+                    rating = test$rating5[rows])
+p7 <- ggplot(ex, aes(rating, prob, fill = model)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.62) +
+  geom_vline(data = truth, aes(xintercept = rating),
+             linetype = "dotted", colour = "grey35") +
+  facet_wrap(~ case, nrow = 1) +
+  scale_fill_manual(values = c(M1 = MODEL_COLS[["M1"]], M2e = MODEL_COLS[["M2e"]])) +
+  theme_pub() +
+  labs(title = "Predictive distributions bend to the user under per-user thresholds",
+       subtitle = "One real test row per user; dotted line marks the realised rating.",
+       x = "Rating", y = "Predicted probability", fill = NULL)
+print(p7)
+save_fig("p07_example_distributions.png", p7, w = 7.2, h = 3.4)
+```
+
+------------------------------------------------------------------------
+
+## 6. Confidence Estimation 
+
+
+
+```{r confidence}
+auc_mw <- function(score, positive) {          # Mann-Whitney AUC, no packages
+  r <- rank(score); n1 <- sum(positive); n0 <- sum(!positive)
+  (sum(r[positive]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+conf_measures <- function(P) {
+  P <- tidy_probs(P)
+  E1 <- as.numeric(P %*% LEVELS5)
+  E2 <- as.numeric(P %*% LEVELS5^2)
+  data.table(maxp    =  apply(P, 1, max),
+             negent  = -(-rowSums(P * log(P))),
+             negsd   = -sqrt(pmax(E2 - E1^2, 0)),
+             neggini = -(1 - rowSums(P^2)))
+}
+y_true <- as.integer(test$rating5)
+conf_tbl <- rbindlist(lapply(names(P_list), function(m) {
+  P <- tidy_probs(P_list[[m]])
+  correct <- max.col(P, ties.method = "first") == y_true
+  cm <- conf_measures(P)
+  data.table(model = m,
+             AUC_maxprob = auc_mw(cm$maxp,    correct),
+             AUC_entropy = auc_mw(cm$negent,  correct),
+             AUC_stdev   = auc_mw(cm$negsd,   correct),
+             AUC_gini    = auc_mw(cm$neggini, correct),
+             cat_acc     = mean(correct))
+}))
+conf_tbl[, model := factor(model, levels = MODEL_LEVELS)]
+setorder(conf_tbl, model)
+kable(conf_tbl, digits = 4,
+      caption = "Confidence AUC: does the distribution's shape know when it is right? (Koren & Sill Sec. 7: Netflix 0.645 \u2192 0.708)")
+fwrite(conf_tbl, file.path(OUT_DIR, "m2e_confidence_auc.csv"))
+```
+
+
+
+### Risk–coverage: the operational view
+
+
+```{r p8-risk-coverage, fig.height=3.8}
+rc <- rbindlist(lapply(c("M1", "M2c", "M2e"), function(m) {
+  P <- tidy_probs(P_list[[m]])
+  correct <- max.col(P, ties.method = "first") == y_true
+  mp  <- apply(P, 1, max)
+  o   <- order(-mp)
+  cs  <- cumsum(correct[o]) / seq_along(o)
+  cov <- seq_along(o) / length(o)
+  keep <- round(seq(0.02, 1, length.out = 120) * length(o))
+  data.table(model = m, coverage = cov[keep], accuracy = cs[keep])
+}))
+rc[, model := factor(model, levels = MODEL_LEVELS)]
+p8 <- ggplot(rc, aes(coverage, accuracy, colour = model)) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = MODEL_COLS) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  theme_pub() +
+  labs(title = "Selective prediction: accuracy vs. coverage",
+       subtitle = "Predictions ranked by max probability. Steeper left end = confidence is informative.",
+       x = "Coverage (fraction of test rows kept)", y = "Category accuracy on kept rows",
+       colour = NULL)
+print(p8)
+save_fig("p08_confidence_risk_coverage.png", p8, w = 7.0, h = 4.0)
+```
+
+------------------------------------------------------------------------
+
+## 7. Calibration / Reliability 
+
+
+```{r p9-reliability, fig.height=3.9}
+rel <- rbindlist(lapply(c("M1", "M2c", "M2e"), function(m) {
+  P <- tidy_probs(P_list[[m]])
+  mp <- apply(P, 1, max)
+  correct <- max.col(P, ties.method = "first") == y_true
+  br <- cut(mp, unique(quantile(mp, seq(0, 1, 0.1))), include.lowest = TRUE)
+  dt <- data.table(mp = mp, correct = correct, bin = br)
+  dt[, .(claimed = mean(mp), realised = mean(correct), n = .N),
+     by = bin][n >= 50][, model := m][]
+}))
+rel[, model := factor(model, levels = MODEL_LEVELS)]
+p9 <- ggplot(rel, aes(claimed, realised, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(size = 1.9) + geom_line(linewidth = 0.6, alpha = 0.7) +
+  scale_colour_manual(values = MODEL_COLS) +
+  coord_equal(xlim = range(c(rel$claimed, rel$realised)),
+              ylim = range(c(rel$claimed, rel$realised))) +
+  theme_pub() +
+  labs(title = "Reliability of the claimed probability",
+       subtitle = "Decile bins of predicted max probability. Dashed = perfect calibration.",
+       x = "Claimed probability (bin mean)", y = "Realised hit rate", colour = NULL)
+print(p9)
+save_fig("p09_confidence_calibration.png", p9, w = 6.4, h = 5.0)
+
+ece <- rel[, .(ECE = sum(n * abs(claimed - realised)) / sum(n)), by = model]
+kable(ece, digits = 4, caption = "Expected calibration error (lower is better)")
+fwrite(ece, file.path(OUT_DIR, "m2e_calibration_ece.csv"))
+```
+
+### 7.1 Sharpness–Calibration Trade-off 
+
+
+
+```{r sharpness-diagnosis}
+# Max probability distributions
+mps <- list(M1 = apply(tidy_probs(P_list$M1), 1, max),
+            M2c = apply(tidy_probs(P_list$M2c), 1, max),
+            M2e = apply(tidy_probs(P_list$M2e), 1, max))
+lo <- max(sapply(mps, min)); hi <- min(sapply(mps, max))
+
+sharp <- rbindlist(lapply(names(mps), function(m) {
+  mp <- mps[[m]]
+  data.table(model = factor(m, levels = MODEL_LEVELS),
+             mean_maxprob = mean(mp), sd_maxprob = sd(mp),
+             min = min(mp), max = max(mp), n = length(mp))
+}))
+
+# ECE on common support only
+ece_c <- rbindlist(lapply(c("M1", "M2c", "M2e"), function(m) {
+  P <- tidy_probs(P_list[[m]])
+  mp <- apply(P, 1, max)
+  correct <- (max.col(P, ties.method = "first") == y_true)
+  ok <- mp >= lo & mp <= hi
+  cr <- correct[ok]; mpk <- mp[ok]
+  d <- data.table(mpk, cr, br = cut(mpk, seq(lo, hi, length.out = 11),
+                                    include.lowest = TRUE))[
+    , .(claimed = mean(mpk), realised = mean(cr), n = .N), by = br][n >= 50]
+  data.table(model = factor(m, levels = MODEL_LEVELS),
+             ECE_all = ece[model == m, ECE],
+             ECE_common = sum(d$n * abs(d$claimed - d$realised)) / sum(d$n),
+             coverage_in_common = mean(ok))
+}))
+
+sharp_cmp <- merge(sharp[, .(model, mean_maxprob, min, max)],
+                   ece_c[, .(model, ECE_all, ECE_common, coverage_in_common)],
+                   by = "model")
+kable(sharp_cmp, digits = 4,
+      caption = sprintf("Sharpness: max-prob distributions and ECE. Common support [%.4f, %.4f].",
+                        lo, hi))
+cat(sprintf("\nInterpretation: M2e's ECE on all data is %.4f, but only %.4f on the common support.\n",
+            ece_c[model == "M2e", ECE_all],
+            ece_c[model == "M2e", ECE_common]))
+cat(sprintf("M2e makes bold claims beyond M1/M2c's comfort zone (coverage %.1f%% overlap).\n",
+            100 * ece_c[model == "M2e", coverage_in_common]))
+```
+
+
+------------------------------------------------------------------------
+
+## 8. Who Gains: per-user improvement 
+
+
+
+```{r p10-peruser, fig.height=3.6}
+pu <- data.table(uid = test$userId,
+                 d = res_list$M2e$row_ll - res_list$M1$row_ll)[
+  , .(dll = mean(d), n = .N), by = uid]
+share_up <- mean(pu$dll > 0)
+p10 <- ggplot(pu, aes(dll)) +
+  geom_histogram(bins = 60, fill = MODEL_COLS[["M2e"]], alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey35") +
+  theme_pub() +
+  labs(title = "Per-user change in mean log-likelihood from M1 to M2e",
+       x = "Per-user mean change in log-likelihood (M2e minus M1)",
+       y = "Number of users")
+print(p10)
+save_fig("p10_peruser_gains.png", p10, w = 6.5, h = 3.8)
+cat(sprintf("users improving: %.1f%% | median per-user dLL: %.4f\n",
+            100 * share_up, median(pu$dll)))
+```
+
+------------------------------------------------------------------------
+
+## 9. Save the Analysis Bundle
+
+```{r save}
+saveRDS(list(master = master, ci = ci, conf = conf_tbl, ece = ece,
+             gap_tbl = gap_tbl, per_user_gain = pu,
+             n_fullscale = nrow(gaps_fs)),
+        file.path(CACHE_DIR, "m2e_analysis_bundle.rds"))
+cat("Figures in", FIG_DIR, "\nTables in", OUT_DIR, "\n")
+```
+
+```{r}
+sapply(P_list[c("M2b","M2c")], function(P) {
+  P <- tidy_probs(P); mu <- as.numeric(P %*% LEVELS5)
+  dv <- outer(rep(1, nrow(P)), LEVELS5) - mu
+  mean(sqrt(pmax(rowSums(P * dv^2), 1e-12)))
+})
+```
+
+
+
