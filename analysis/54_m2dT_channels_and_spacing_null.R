@@ -1,70 +1,8 @@
 # =====================================================================
 # 54_m2dT_channels_and_spacing_null.R
-#
-# Four follow-ups to 52, all needing the same session and the same
-# three probability matrices, so they are done together:
-#
-#   (1) two-way bootstrap intervals for calibration error and
-#       sharpness across M2d -> M2d+T -> M2e            (52 section 4)
-#   (2) whether M2d+T is a third instance of a likelihood gain that
-#       is not a calibration gain                        (52 section 4)
-#   (3) a null for the cut-point spacing agreement       (52 section 5)
-#   (4) intervals for the threshold gain by training volume, and a
-#       direct test of the 100+ fall-back                (52 section 5)
-#
+
 # RUN INSIDE THE SAME CLEAN 06b SESSION, AFTER 52. It reads the cached
-# m2dT_frozen_factors.rds rather than retraining. Do not source any
-# STARTUP file into this session.
-#
-# ---------------------------------------------------------------------
-# WHY (1) AND (2) MATTER MORE THAN THE LIKELIHOOD DECOMPOSITION
-#
-# 52 found that 78.4% of the M2d -> M2e likelihood increment comes from
-# the cut points. On the thesis's own primary criterion the picture
-# looks different: of the 0.01380 improvement in calibration error,
-# the cut points supply roughly 0.00389 and the refitted factors
-# roughly 0.00991. The likelihood decomposition and the calibration
-# decomposition point at different components of the same model.
-#
-# Neither of those calibration figures has an interval. Section 1
-# supplies them. If the intervals overlap heavily, the reversal is not
-# established and neither sentence should be written.
-#
-# Section 2 asks the sharper question. M2d+T's mean predictive standard
-# deviation is 0.79148, against M2d's 0.83435 and M2e's 0.82500 -- it
-# is markedly the sharpest of the three, and not monotone in the
-# ladder. A model that gains likelihood while becoming sharper may be
-# gaining on confidence rather than on location. That is the pattern
-# already documented for M1 and for M3b(30), and the thesis's central
-# methodological claim rests on that pairing. A third instance arising
-# inside the main result would strengthen the claim and complicate the
-# main result at the same time. It is tested here rather than asserted.
-#
-# ---------------------------------------------------------------------
-# WHY (3) IS A NULL AND NOT A CONFIRMATION
-#
-# 52 reported Spearman correlations of 0.85, 0.90 and 0.96 between
-# M2d+T's cut-point spacings and M2e's, and read them as two fits
-# recovering the same structure from different factor matrices.
-#
-# That reading has no baseline. Both models were fitted to the same
-# people's ratings, and a user's cut-point spacings are strongly
-# determined by their own rating histogram: someone who rates almost
-# everything 4 or 5 will have wide low spacings under any fit. So the
-# question is not whether the two agree, but whether they agree by more
-# than two independent summaries of the same histogram would.
-#
-# The null here is the spacing implied directly by the user's empirical
-# cumulative rating distribution, with no model involved. If that null
-# already correlates at 0.9 with both fits, the agreement in 52 is a
-# property of the data and section 6d gains nothing from it.
-#
-# The null is not defined for users who never use some level, because
-# an empirical cumulative probability of 0 or 1 maps to an infinite
-# threshold. Only 35.4% of users use all five levels. Both a strict
-# version (complete users only, no smoothing) and a smoothed version
-# (all users, add-one) are reported, because a result that holds only
-# under one of them is a result about the smoothing.
+# m2dT_frozen_factors.rds rather than retraining. 
 # =====================================================================
 
 suppressPackageStartupMessages({ library(data.table); library(ggplot2) })
