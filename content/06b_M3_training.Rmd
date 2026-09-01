@@ -1,0 +1,736 @@
+---
+title: "M3: OrdRec with Movie Content Features (Phase A, Nm >= 10)"
+author: "Dina Muhamaitihan | Movie Recommendation"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+library(data.table)
+library(ggplot2)
+library(knitr)
+```
+
+## Aim
+
+M2e is the paper's configuration and the end of the ordinal ladder. M3
+asks the question Koren and Sill leave open in their final paragraph:
+whether *item attributes for rarely rated items* add anything on top of
+it. Two models are trained, both cold-start, both with M2e's
+hyperparameters:
+
+$$\text{M3a:}\quad y_{ui} = b_i + w^\top c_i + q_i^\top p_u$$
+$$\text{M3b:}\quad y_{ui} = b_i + w^\top c_i + \big(q_i + W^\top c_i\big)^\top p_u$$
+
+with $c_i$ the standardised content vector from `05b`. Everything else —
+the logit link, the per-user thresholds $t^{(u)}$, the likelihood, the
+mini-batch trainer — is M2e's, unchanged.
+
+**What M3a actually does, and why it is not vacuous.** Every film already
+has a free bias $b_i$, so $w^\top c_i$ adds *no capacity*: with $b_i$
+unpenalised the two models would be exactly equivalent. The content term
+acts only through the penalty. Because $b_i$ is shrunk toward zero and
+the film's total bias is $b_i + w^\top c_i$, the effect of the content
+term is to move the **shrinkage target** from the global mean to a
+content-predicted value. M3a is therefore a feature-based prior on the
+item bias, in the sense of Agarwal and Chen's RLFM, whose MovieLens-100K
+result — a test set with no new users or items, where the entire gain
+came from "better regularization achieved through feature-based prior" —
+is the closest published analogue to this setup. M3b extends the same
+logic from the bias to the factor, as in Wang and Blei's
+$v_j = \theta_j + \epsilon_j$.
+
+**The prediction being tested.** Shrinkage matters most where the data is
+thinnest, so the gain should decay monotonically with item support. Strub
+et al. report exactly this on MovieLens-10M: an RMSE improvement of
+1.811% in the sparsest quintile of items falling to 0.052% in the
+densest, with only 0.206% overall. Pilászy and Tikk locate the crossover
+at roughly ten ratings — and this selection prunes at $N_m \ge 10$, so
+**the whole catalogue sits on the side where ratings already dominate
+metadata.** The pre-registered expectation is therefore a small or
+zero overall gain with a monotone decay across strata. The stratified
+contrast, not the headline number, is the result.
+
+**Trust chain.** The likelihood/gradient core is M2e's, which passed the
+numerical check in 08 and the `clm` cross-check in 07. The two new
+gradient blocks ($w$, $W$) get their own numerical check in Section 4,
+and the trainer is re-run through M2e's synthetic self-test with the
+content term switched off, which must reproduce M2e's behaviour.
+
+---
+
+## 0. Settings
+
+```{r config}
+# --- edit these paths (same as 07/09/10, plus the 08_M3 cache) --------
+SEL_FILE  <- "D:/桌面/movie-recommendation-dissertation/06_models/selection_v7_2018-04_6m_Nu10_Nm10.rds"
+CACHE_M12 <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/07_M1_M2"
+CACHE_M3  <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/08_M3"
+OUT_DIR   <- "D:/桌面/movie-recommendation-dissertation/06_models/output/08_M3"
+# ----------------------------------------------------------------------
+
+dir.create(CACHE_M3, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_DIR,  showWarnings = FALSE, recursive = TRUE)
+
+SEED     <- 2024L
+SVD_DIM  <- 16L
+K_LEVELS <- 5L
+LEVELS5  <- 1:5
+CUTS     <- c(1.5, 2.5, 3.5, 4.5)
+
+# Inherited verbatim from the 09 scan. No re-tuning: any difference
+# between M2e and M3 must be attributable to the content term alone.
+BATCH_SIZE <- 512L
+MAX_EPOCHS <- 200L
+PATIENCE   <- 8L
+ETA_DECAY  <- 0.95
+CLIP       <- 25
+ETA        <- 0.03
+LAMBDA     <- 0.02
+
+# The ONE new hyperparameter. The content block has a different
+# dimension and a different scale from the factor block, so libFM's
+# grouped-regularisation argument applies: it gets its own lambda,
+# scanned on the calibration set. M2e's lambda is untouched.
+LAMBDA_C_GRID <- c(0.005, 0.02, 0.08, 0.32, 1.28)
+
+N_BOOT <- 2000L
+
+set.seed(SEED)
+```
+
+---
+
+## 1. Load the Selection and the Features
+
+```{r load-data}
+sel   <- readRDS(SEL_FILE)
+fit   <- as.data.table(sel$fit)
+calib <- as.data.table(sel$calib)
+test  <- as.data.table(sel$test)
+
+to_int5 <- function(d) { d[, rating5 := as.integer(as.character(rating5))]; d[] }
+fit <- to_int5(fit); calib <- to_int5(calib); test <- to_int5(test)
+
+user_map  <- data.table(userId  = sort(unique(fit$userId)))[,  user_idx  := .I]
+movie_map <- data.table(movieId = sort(unique(fit$movieId)))[, movie_idx := .I]
+add_idx <- function(d) {
+  d <- merge(d, user_map,  by = "userId",  all.x = TRUE, sort = FALSE)
+  d <- merge(d, movie_map, by = "movieId", all.x = TRUE, sort = FALSE)
+  setDT(d)
+  d[, cold := is.na(user_idx) | is.na(movie_idx)]
+  d[]
+}
+fit   <- add_idx(fit)[cold == FALSE]
+calib <- add_idx(calib)[cold == FALSE]
+test  <- add_idx(test)[cold == FALSE]
+
+nU <- nrow(user_map); nI <- nrow(movie_map)
+cat(sprintf("fit %d | calib %d | test %d | users %d | movies %d\n",
+            nrow(fit), nrow(calib), nrow(test), nU, nI))
+stopifnot(nrow(fit) == 393364L)
+
+# ---- content features -------------------------------------------------
+feat <- readRDS(file.path(CACHE_M3, "m3_features_v1.rds"))
+Cmat <- feat$C
+# The single most important guard in this file: a silent row misalignment
+# between C and movie_idx would attach every film's content to a
+# different film, and the model would still train happily.
+stopifnot(identical(as.integer(feat$movie_map$movieId),
+                    as.integer(movie_map$movieId)),
+          nrow(Cmat) == nI,
+          all(is.finite(Cmat)))
+nF <- ncol(Cmat)
+cat(sprintf("Content matrix: %d films x %d features\n", nI, nF))
+print(table(feat$block))
+
+support <- feat$support
+setorder(support, movie_idx)
+stopifnot(identical(support$movie_idx, seq_len(nI)))
+```
+
+---
+
+## 2. Core Functions
+
+Metric functions are verbatim from 07/09/10 so the evaluation protocol
+stays bit-identical across the whole ladder. The scoring functions are
+M2e's with the content term added; setting `W = NULL` and `w = 0`
+recovers M2e exactly, which is what the self-test in Section 4 exploits.
+
+```{r core-functions}
+sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
+
+# Effective item factor: q_i + W' c_i. W = NULL means M3a (or M2e).
+q_eff <- function(par, i) {
+  if (is.null(par$W)) par$Q[i, , drop = FALSE]
+  else par$Q[i, , drop = FALSE] + Cmat[i, , drop = FALSE] %*% par$W
+}
+
+calc_scores_m3 <- function(par, u, i) {
+  s <- par$bi[i] + rowSums(par$P[u, , drop = FALSE] * q_eff(par, i))
+  if (!is.null(par$w)) s <- s + as.numeric(Cmat[i, , drop = FALSE] %*% par$w)
+  s
+}
+
+user_threshold_rows <- function(par, u) {
+  E  <- exp(par$beta[u, , drop = FALSE])
+  t1 <- par$t1[u]
+  cbind(t1, t1 + E[, 1], t1 + E[, 1] + E[, 2],
+        t1 + E[, 1] + E[, 2] + E[, 3])
+}
+
+ordrec_forward_e <- function(y, r, Tmat) {
+  n <- length(y)
+  g_hi <- ifelse(r == K_LEVELS, 1,
+                 sigmoid(Tmat[cbind(seq_len(n), pmin(r, K_LEVELS - 1L))] - y))
+  g_lo <- ifelse(r == 1L, 0,
+                 sigmoid(Tmat[cbind(seq_len(n), pmax(r - 1L, 1L))] - y))
+  list(prob = pmax(g_hi - g_lo, 1e-12),
+       A = g_hi * (1 - g_hi), B = g_lo * (1 - g_lo))
+}
+
+ordrec_mean_ll_m3 <- function(par, dat) {
+  y  <- calc_scores_m3(par, dat$u, dat$i)
+  Tm <- user_threshold_rows(par, dat$u)
+  mean(log(ordrec_forward_e(y, dat$r, Tm)$prob))
+}
+
+ordrec_row_ll_m3 <- function(par, dat) {
+  y  <- calc_scores_m3(par, dat$u, dat$i)
+  Tm <- user_threshold_rows(par, dat$u)
+  log(ordrec_forward_e(y, dat$r, Tm)$prob)
+}
+
+ordrec_probs_m3 <- function(par, u, i) {
+  y  <- calc_scores_m3(par, u, i)
+  Tm <- user_threshold_rows(par, u)
+  CP <- plogis(Tm - y)
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+# ---- metrics, verbatim from 07/09/10 ---------------------------------
+tidy_probs <- function(P) { P <- pmax(P, 1e-12); P / rowSums(P) }
+
+metric_set <- function(P, y) {
+  y   <- as.integer(y); P <- tidy_probs(P); n <- nrow(P)
+  ll  <- log(P[cbind(seq_len(n), y)])
+  E   <- as.numeric(P %*% LEVELS5)
+  CP  <- t(apply(P, 1, cumsum))
+  IND <- outer(y, LEVELS5, function(a, b) as.numeric(a <= b))
+  rps <- rowSums((CP[, 1:(K_LEVELS - 1)] - IND[, 1:(K_LEVELS - 1)])^2) / (K_LEVELS - 1)
+  list(row_ll = ll, row_rps = rps,
+       tbl = data.table(meanLL = mean(ll),
+                        RMSE   = sqrt(mean((y - E)^2)),
+                        RPS    = mean(rps),
+                        CatAcc = mean(max.col(P, ties.method = "first") == y)))
+}
+
+ndcg_at_10 <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), rel = 2^as.integer(y) - 1)
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0) return(NA_real_)
+  mean(d[, {
+    k <- min(10L, .N)
+    dcg  <- sum(rel[order(-s)][1:k]   / log2(seq_len(k) + 1))
+    idcg <- sum(rel[order(-rel)][1:k] / log2(seq_len(k) + 1))
+    .(ndcg = if (idcg > 0) dcg / idcg else NA_real_)
+  }, by = uid]$ndcg, na.rm = TRUE)
+}
+
+fcp_stat <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), y = as.integer(y))
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0) return(NA_real_)
+  pu <- d[, {
+    sy_gt <- outer(y, y, `>`); sy_lt <- outer(y, y, `<`)
+    ss_gt <- outer(s, s, `>`); ss_ge <- outer(s, s, `>=`)
+    list(nc = sum(ss_gt & sy_gt), nd = sum(ss_ge & sy_lt))
+  }, by = uid]
+  sum(pu$nc) / (sum(pu$nc) + sum(pu$nd))
+}
+```
+
+---
+
+## 3. The Trainer
+
+M2e's trainer with two new parameter blocks. Three decisions carry over
+from 09/10 and one is new:
+
+- **Per-user thresholds, $b_i$, $P$, $Q$**: batch-SUM gradient with
+  per-occurrence L2, exactly as in 10. These are entity parameters,
+  touched by only some rows of a batch.
+- **$w$ and $W$ are global parameters**, touched by *every* row of every
+  batch, like the four global thresholds in 09. They therefore take the
+  batch-MEAN gradient and a plain (not per-occurrence) L2 at
+  `lambda_c`. Using the sum here would make their effective learning
+  rate scale with batch size.
+- **$q_i$ is penalised toward zero, not toward $W^\top c_i$.** That is
+  the whole mechanism: the total item factor is $q_i + W^\top c_i$, so
+  shrinking the residual $q_i$ pulls the total toward the content
+  prediction. Same for $b_i$ against $w^\top c_i$.
+- Clipping, learning-rate decay and early stopping on calibration
+  meanLL are unchanged.
+
+```{r trainer}
+train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
+                            use_W = FALSE,
+                            batch_size = BATCH_SIZE, max_epochs = MAX_EPOCHS,
+                            patience = PATIENCE, seed = SEED, clip = CLIP,
+                            eta_decay = ETA_DECAY, verbose = TRUE) {
+  par <- init
+  if (!use_W) par$W <- NULL
+  n <- length(dat_fit$u)
+  best <- list(ll = -Inf, par = par, epoch = 0L)
+  hist <- data.table(epoch = integer(), fit_meanLL = numeric(),
+                     calib_meanLL = numeric(), clip_rate = numeric(),
+                     norm_w = numeric(), norm_W = numeric())
+  set.seed(seed)
+  eta_e <- eta
+
+  for (ep in seq_len(max_epochs)) {
+    perm <- sample.int(n); n_clip <- 0L
+    for (b0 in seq(1L, n, by = batch_size)) {
+      idx <- perm[b0:min(b0 + batch_size - 1L, n)]
+      u <- dat_fit$u[idx]; i <- dat_fit$i[idx]; r <- dat_fit$r[idx]
+      nb <- length(idx)
+      Cb <- Cmat[i, , drop = FALSE]
+
+      y  <- calc_scores_m3(par, u, i)
+      E  <- exp(par$beta[u, , drop = FALSE])
+      t1v <- par$t1[u]
+      Tm <- cbind(t1v, t1v + E[, 1], t1v + E[, 1] + E[, 2],
+                  t1v + E[, 1] + E[, 2] + E[, 3])
+      fw <- ordrec_forward_e(y, r, Tm)
+      c_hi <- fw$A / fw$prob; c_lo <- fw$B / fw$prob
+      n_clip <- n_clip + sum(c_hi > clip) + sum(c_lo > clip)
+      c_hi <- pmin(c_hi, clip); c_lo <- pmin(c_lo, clip)
+      dy <- c_lo - c_hi                       # dl/dy per row
+
+      # ---- per-user thresholds: batch-SUM (verbatim from 10) ---------
+      g_t1 <- rowsum(c_hi - c_lo, u)
+      g_b1 <- rowsum(E[, 1] * (c_hi * (1L <= r - 1L) - c_lo * (1L <= r - 2L)), u)
+      g_b2 <- rowsum(E[, 2] * (c_hi * (2L <= r - 1L) - c_lo * (2L <= r - 2L)), u)
+      g_b3 <- rowsum(E[, 3] * (c_hi * (3L <= r - 1L) - c_lo * (3L <= r - 2L)), u)
+      ug <- as.integer(rownames(g_t1))
+      par$t1[ug]      <- par$t1[ug]      + eta_e * as.numeric(g_t1)
+      par$beta[ug, 1] <- par$beta[ug, 1] + eta_e * as.numeric(g_b1)
+      par$beta[ug, 2] <- par$beta[ug, 2] + eta_e * as.numeric(g_b2)
+      par$beta[ug, 3] <- par$beta[ug, 3] + eta_e * as.numeric(g_b3)
+
+      # ---- user factors: gradient uses the EFFECTIVE item factor -----
+      Qe <- q_eff(par, i)
+      SP <- rowsum(dy * Qe, u)
+      nu <- as.numeric(rowsum(rep(1, nb), u))
+      par$P[ug, ] <- par$P[ug, ] + eta_e * (SP - lambda * nu * par$P[ug, , drop = FALSE])
+
+      # ---- items: residual bias and residual factor ------------------
+      si <- rowsum(dy, i); ig <- as.integer(rownames(si))
+      ni <- as.numeric(rowsum(rep(1, nb), i))
+      par$bi[ig] <- par$bi[ig] + eta_e * (as.numeric(si) - lambda * ni * par$bi[ig])
+      SQ <- rowsum(dy * par$P[u, , drop = FALSE], i)
+      par$Q[ig, ] <- par$Q[ig, ] + eta_e * (SQ - lambda * ni * par$Q[ig, , drop = FALSE])
+
+      # ---- content bias w: global, batch-MEAN, lambda_c --------------
+      g_w <- as.numeric(crossprod(Cb, dy)) / nb
+      par$w <- par$w + eta_e * (g_w - lambda_c * par$w)
+
+      # ---- content factor W: global, batch-MEAN, lambda_c ------------
+      if (!is.null(par$W)) {
+        g_W <- crossprod(Cb, dy * par$P[u, , drop = FALSE]) / nb
+        par$W <- par$W + eta_e * (g_W - lambda_c * par$W)
+      }
+
+      if (any(!is.finite(par$w)) || any(!is.finite(par$t1[ug])))
+        return(list(diverged = TRUE, best_ll = -Inf, best_epoch = 0L, history = hist))
+    }
+
+    ll_c <- ordrec_mean_ll_m3(par, dat_calib)
+    ll_f <- ordrec_mean_ll_m3(par, dat_fit)
+    hist <- rbind(hist, data.table(
+      epoch = ep, fit_meanLL = ll_f, calib_meanLL = ll_c,
+      clip_rate = n_clip / n,
+      norm_w = sqrt(sum(par$w^2)),
+      norm_W = if (is.null(par$W)) NA_real_ else sqrt(sum(par$W^2))))
+    if (verbose) cat(sprintf("    epoch %2d  fit %.5f  calib %.5f  |w| %.3f\n",
+                             ep, ll_f, ll_c, sqrt(sum(par$w^2))))
+    if (ll_c > best$ll + 1e-5) best <- list(ll = ll_c, par = par, epoch = ep)
+    else if (ep - best$epoch >= patience) break
+    eta_e <- eta_e * eta_decay
+  }
+  list(diverged = FALSE, best_ll = best$ll, par = best$par,
+       best_epoch = best$epoch, history = hist)
+}
+```
+
+---
+
+## 4. Correctness Checks
+
+### 4a. Numerical gradient check on the two new blocks
+
+The analytic gradients for $w$ and $W$ are the only genuinely new algebra
+in this file, so they are checked against finite differences on a small
+synthetic problem before anything is trained.
+
+```{r grad-check}
+set.seed(11)
+.nU <- 40L; .nI <- 30L; .K <- 4L; .nF <- 6L; .n <- 500L
+.Csave <- Cmat
+Cmat <<- matrix(rnorm(.nI * .nF), .nI, .nF)     # temporary global for q_eff
+
+.p <- list(t1 = rnorm(.nU, -1, 0.3),
+           beta = matrix(rnorm(.nU * 3, 0, 0.2), .nU, 3),
+           bi = rnorm(.nI, 0, 0.3),
+           P = matrix(rnorm(.nU * .K, 0, 0.3), .nU, .K),
+           Q = matrix(rnorm(.nI * .K, 0, 0.3), .nI, .K),
+           w = rnorm(.nF, 0, 0.2),
+           W = matrix(rnorm(.nF * .K, 0, 0.2), .nF, .K))
+.d <- list(u = sample(.nU, .n, TRUE), i = sample(.nI, .n, TRUE),
+           r = sample(5L, .n, TRUE))
+
+.obj <- function(p) sum(log(ordrec_forward_e(
+  calc_scores_m3(p, .d$u, .d$i), .d$r, user_threshold_rows(p, .d$u))$prob))
+
+.analytic <- function(p) {
+  y  <- calc_scores_m3(p, .d$u, .d$i)
+  Tm <- user_threshold_rows(p, .d$u)
+  fw <- ordrec_forward_e(y, .d$r, Tm)
+  dy <- fw$B / fw$prob - fw$A / fw$prob
+  Cb <- Cmat[.d$i, , drop = FALSE]
+  list(w = as.numeric(crossprod(Cb, dy)),
+       W = crossprod(Cb, dy * p$P[.d$u, , drop = FALSE]))
+}
+.g <- .analytic(.p)
+.eps <- 1e-6
+.num_w <- sapply(seq_len(.nF), function(k) {
+  pp <- .p; pp$w[k] <- pp$w[k] + .eps; pm <- .p; pm$w[k] <- pm$w[k] - .eps
+  (.obj(pp) - .obj(pm)) / (2 * .eps)
+})
+.num_W <- outer(seq_len(.nF), seq_len(.K), Vectorize(function(a, b) {
+  pp <- .p; pp$W[a, b] <- pp$W[a, b] + .eps
+  pm <- .p; pm$W[a, b] <- pm$W[a, b] - .eps
+  (.obj(pp) - .obj(pm)) / (2 * .eps)
+}))
+cat(sprintf("max |analytic - numeric|  w: %.3e   W: %.3e\n",
+            max(abs(.g$w - .num_w)), max(abs(.g$W - .num_W))))
+stopifnot(max(abs(.g$w - .num_w)) < 1e-4,
+          max(abs(.g$W - .num_W)) < 1e-4)
+cat("GRADIENT CHECK: PASS\n")
+Cmat <<- .Csave
+rm(.p, .d, .g, .num_w, .num_W, .Csave)
+```
+
+### 4b. Reduction check: content off must reproduce M2e
+
+With `w = 0`, `W = NULL` and `lambda_c` irrelevant, the trainer's update
+equations reduce to 10's line for line. Running it from M2e's own
+cold-start initialisation and the same seed must land on the same
+calibration likelihood.
+
+```{r reduction-check}
+m2e <- readRDS(file.path(CACHE_M12, "m2e_final.rds"))
+stopifnot(!m2e$diverged)
+cat(sprintf("Cached M2e: best epoch %d | calib meanLL %.5f\n",
+            m2e$best_epoch, m2e$best_ll))
+
+dat_fit   <- list(u = fit$user_idx,   i = fit$movie_idx,   r = fit$rating5)
+dat_calib <- list(u = calib$user_idx, i = calib$movie_idx, r = calib$rating5)
+dat_test  <- list(u = test$user_idx,  i = test$movie_idx,  r = test$rating5)
+
+marg5  <- prop.table(tabulate(dat_fit$r, K_LEVELS))
+t_marg <- qlogis(cumsum(marg5)[1:4])
+set.seed(SEED)
+init_cold <- list(t1   = rep(t_marg[1], nU),
+                  beta = matrix(log(pmax(diff(t_marg), 1e-3)), nU, 3, byrow = TRUE),
+                  bi = rep(0, nI),
+                  P = matrix(rnorm(nU * SVD_DIM, 0, 0.05), nU, SVD_DIM),
+                  Q = matrix(rnorm(nI * SVD_DIM, 0, 0.05), nI, SVD_DIM),
+                  w = rep(0, nF),
+                  W = matrix(0, nF, SVD_DIM))
+
+red_cache <- file.path(CACHE_M3, "m3_reduction_check.rds")
+if (file.exists(red_cache)) {
+  m3_null <- readRDS(red_cache)
+} else {
+  init0 <- init_cold; init0$w <- rep(0, nF)
+  m3_null <- train_ordrec_m3(dat_fit, dat_calib, init0, eta = ETA,
+                             lambda = LAMBDA, lambda_c = 1e6,  # pins w at 0
+                             use_W = FALSE, verbose = FALSE)
+  saveRDS(m3_null, red_cache)
+}
+cat(sprintf("Reduction run: calib %.5f (M2e %.5f, diff %.2e)\n",
+            m3_null$best_ll, m2e$best_ll, m3_null$best_ll - m2e$best_ll))
+stopifnot(abs(m3_null$best_ll - m2e$best_ll) < 5e-4)
+cat("REDUCTION CHECK: PASS\n")
+```
+
+---
+
+## 5. Selecting `lambda_c` on Calibration
+
+M2e's `lambda` stays at 0.02 throughout. Only the content block's penalty
+is scanned, on the calibration set, as libFM's grouped regularisation
+argument prescribes. The scan is run for M3a; M3b reuses the selected
+value so the M3a/M3b contrast is not confounded by a second search.
+
+```{r lambda-scan}
+scan_cache <- file.path(CACHE_M3, "m3a_lambda_scan.rds")
+if (file.exists(scan_cache)) {
+  scan_res <- readRDS(scan_cache)
+} else {
+  scan_res <- rbindlist(lapply(LAMBDA_C_GRID, function(lc) {
+    cat(sprintf("  lambda_c = %.4f\n", lc))
+    r <- train_ordrec_m3(dat_fit, dat_calib, init_cold, eta = ETA,
+                         lambda = LAMBDA, lambda_c = lc,
+                         use_W = FALSE, verbose = FALSE)
+    data.table(lambda_c = lc, calib_meanLL = r$best_ll,
+               best_epoch = r$best_epoch, norm_w = sqrt(sum(r$par$w^2)),
+               diverged = r$diverged)
+  }))
+  saveRDS(scan_res, scan_cache)
+}
+kable(scan_res, digits = 5, caption = "M3a: calibration scan over the content penalty")
+
+LAMBDA_C <- scan_res[which.max(calib_meanLL), lambda_c]
+cat(sprintf("Selected lambda_c = %g\n", LAMBDA_C))
+if (LAMBDA_C == min(LAMBDA_C_GRID) || LAMBDA_C == max(LAMBDA_C_GRID))
+  warning("lambda_c selected at a grid boundary - widen LAMBDA_C_GRID.")
+
+p_scan <- ggplot(scan_res, aes(lambda_c, calib_meanLL)) +
+  geom_line(colour = "steelblue") + geom_point(size = 2) +
+  scale_x_log10() + theme_minimal() +
+  geom_hline(yintercept = m2e$best_ll, linetype = "dashed", colour = "grey40") +
+  labs(title = "M3a: content penalty scan",
+       subtitle = "Dashed line is M2e's calibration likelihood",
+       x = expression(lambda[c]), y = "calibration mean log-likelihood")
+print(p_scan)
+ggsave(file.path(OUT_DIR, "m3b_lambda_scan.png"), p_scan, width = 7, height = 4, dpi = 150)
+```
+
+---
+
+## 6. Final Training
+
+```{r final-train}
+fit_or_load <- function(tag, use_W) {
+  f <- file.path(CACHE_M3, sprintf("%s_final.rds", tag))
+  if (file.exists(f)) { cat(sprintf("Loaded cached %s.\n", tag)); return(readRDS(f)) }
+  r <- train_ordrec_m3(dat_fit, dat_calib, init_cold, eta = ETA,
+                       lambda = LAMBDA, lambda_c = LAMBDA_C,
+                       use_W = use_W, verbose = TRUE)
+  saveRDS(r, f); r
+}
+m3a <- fit_or_load("m3a", use_W = FALSE)
+m3b <- fit_or_load("m3b", use_W = TRUE)
+stopifnot(!m3a$diverged, !m3b$diverged)
+
+train_tbl <- data.table(
+  model = c("M2e", "M3a", "M3b"),
+  best_epoch   = c(m2e$best_epoch, m3a$best_epoch, m3b$best_epoch),
+  calib_meanLL = c(m2e$best_ll,    m3a$best_ll,    m3b$best_ll),
+  fit_calib_gap = c(
+    m2e$history[epoch == m2e$best_epoch, fit_meanLL - calib_meanLL],
+    m3a$history[epoch == m3a$best_epoch, fit_meanLL - calib_meanLL],
+    m3b$history[epoch == m3b$best_epoch, fit_meanLL - calib_meanLL]))
+kable(train_tbl, digits = 5, caption = "Training summary")
+```
+
+---
+
+## 7. Test-Month Evaluation
+
+```{r test-eval}
+par_m2e <- m2e$par; par_m2e$w <- NULL; par_m2e$W <- NULL   # scored by the same code path
+
+P_list <- list(M2e = ordrec_probs_m3(par_m2e, dat_test$u, dat_test$i),
+               M3a = ordrec_probs_m3(m3a$par, dat_test$u, dat_test$i),
+               M3b = ordrec_probs_m3(m3b$par, dat_test$u, dat_test$i))
+
+res_list <- lapply(P_list, metric_set, y = test$rating5)
+metrics <- rbindlist(lapply(names(res_list), function(m)
+  cbind(data.table(model = m), res_list[[m]]$tbl)))
+
+rank_tbl <- rbindlist(lapply(names(P_list), function(m) {
+  E <- as.numeric(tidy_probs(P_list[[m]]) %*% LEVELS5)
+  data.table(model = m,
+             NDCG10 = ndcg_at_10(E, test$rating5, test$userId),
+             FCP    = fcp_stat(E, test$rating5, test$userId))
+}))
+metrics <- merge(metrics, rank_tbl, by = "model", sort = FALSE)
+kable(metrics, digits = 5, caption = "Test month (2018-10)")
+```
+
+---
+
+## 8. The Result: Paired Contrasts, Stratified by Item Support
+
+Two decisions here decide whether the analysis can see anything at all.
+
+**Paired, not marginal.** The quantity of interest is the per-row
+difference $\Delta_{ui} = \ell^{M3}_{ui} - \ell^{M2e}_{ui}$, resampled as
+a difference. Comparing two separately-resampled marginal means would
+carry the between-row variance of the likelihood itself, which is orders
+of magnitude larger than the effect being measured and would swamp it.
+
+**Two-way bootstrap.** Test rows are crossed by user and by item, not
+independent, so the resampling weights both margins by the product of
+independent draw counts, as in file 20 (Owen and Eckles).
+
+```{r paired-boot}
+LLm <- sapply(P_list, function(P) log(tidy_probs(P)[cbind(seq_len(nrow(P)), test$rating5)]))
+D <- data.table(d_a = LLm[, "M3a"] - LLm[, "M2e"],
+                d_b = LLm[, "M3b"] - LLm[, "M2e"],
+                d_ba = LLm[, "M3b"] - LLm[, "M3a"])
+
+test[, n_train := support$n_train[movie_idx]]
+test[, nm_band := cut(n_train, c(9, 20, 50, 200, Inf),
+                      labels = c("10-20", "21-50", "51-200", "200+"))]
+cat("Test rows per stratum:\n"); print(test[, .N, by = nm_band][order(nm_band)])
+
+u_key <- as.integer(factor(test$userId))
+i_key <- as.integer(factor(test$movieId))
+nU_t <- max(u_key); nI_t <- max(i_key); n_test <- nrow(test)
+
+boot_paired <- function(d, rows, B = N_BOOT) {
+  dv <- d[rows]; uk <- u_key[rows]; ik <- i_key[rows]
+  out <- numeric(B)
+  for (b in seq_len(B)) {
+    cu <- tabulate(sample.int(nU_t, nU_t, replace = TRUE), nbins = nU_t)
+    ci <- tabulate(sample.int(nI_t, nI_t, replace = TRUE), nbins = nI_t)
+    w  <- cu[uk] * ci[ik]
+    sw <- sum(w)
+    out[b] <- if (sw > 0) sum(dv * w) / sw else NA_real_
+  }
+  out[is.finite(out)]
+}
+
+set.seed(SEED)
+strata <- c(list(All = seq_len(n_test)),
+            split(seq_len(n_test), test$nm_band))
+contrasts <- c(d_a = "M3a - M2e", d_b = "M3b - M2e", d_ba = "M3b - M3a")
+
+boot_tbl <- rbindlist(lapply(names(strata), function(s) {
+  rows <- strata[[s]]
+  rbindlist(lapply(names(contrasts), function(cn) {
+    bs <- boot_paired(D[[cn]], rows)
+    data.table(stratum = s, contrast = contrasts[[cn]],
+               n_rows = length(rows),
+               delta = mean(D[[cn]][rows]),
+               lo = unname(quantile(bs, 0.025)),
+               hi = unname(quantile(bs, 0.975)))
+  }))
+}))
+boot_tbl[, sig := ifelse(lo > 0 | hi < 0, "*", "")]
+kable(boot_tbl, digits = 5,
+      caption = "Paired mean log-likelihood gain, two-way bootstrap 95% CI")
+fwrite(boot_tbl, file.path(OUT_DIR, "m3c_stratified_contrasts.csv"))
+```
+
+```{r decay-plot, fig.height=4.2}
+pd <- boot_tbl[stratum != "All"]
+pd[, stratum := factor(stratum, levels = c("10-20", "21-50", "51-200", "200+"))]
+p_decay <- ggplot(pd, aes(stratum, delta, colour = contrast, group = contrast)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12,
+                position = position_dodge(0.35)) +
+  geom_point(size = 2.4, position = position_dodge(0.35)) +
+  theme_minimal() +
+  labs(title = "Does the content gain decay with item support?",
+       subtitle = "Pre-registered prediction: monotone decline, near zero in the densest stratum",
+       x = "training ratings for the film", y = "paired mean log-likelihood gain (nats)",
+       colour = NULL)
+print(p_decay)
+ggsave(file.path(OUT_DIR, "m3d_support_decay.png"), p_decay,
+       width = 8, height = 4.2, dpi = 150)
+```
+
+> **Plain read.** The `All` row is the headline and is expected to be
+> small. The pattern across the four strata is the result. A monotone
+> decline confirms the shrinkage account and reproduces Strub et al.'s
+> quintile pattern under an ordinal likelihood rather than RMSE; a flat
+> profile would falsify it and would need explaining — the first thing to
+> check would be the feature/support correlations written out by `05b`,
+> since a content-composition difference between strata would produce a
+> gain that does not come from sparsity at all.
+
+---
+
+## 9. Where the Content Term Puts Its Weight
+
+Which blocks earn their parameters. This is descriptive, not inferential:
+the coefficients are penalised and correlated, so they are read as
+"where the model chose to spend capacity", not as effect estimates.
+
+```{r block-weights}
+wt <- data.table(feature = colnames(Cmat), block = feat$block,
+                 w_a = m3a$par$w, w_b = m3b$par$w,
+                 W_norm = sqrt(rowSums(m3b$par$W^2)))
+blk <- wt[, .(n_features = .N,
+              L2_w = sqrt(sum(w_a^2)),
+              L2_W = sqrt(sum(W_norm^2))), by = block][order(-L2_w)]
+kable(blk, digits = 4, caption = "Content weight by feature block (M3a bias, M3b factor)")
+fwrite(wt, file.path(OUT_DIR, "m3e_content_weights.csv"))
+
+top <- wt[order(-abs(w_a))][1:20]
+p_w <- ggplot(top, aes(reorder(feature, w_a), w_a, fill = block)) +
+  geom_col() + coord_flip() + theme_minimal() +
+  labs(title = "Largest content-bias coefficients (M3a)",
+       subtitle = "Penalised and correlated: read as allocation of capacity, not as effects",
+       x = NULL, y = expression(w))
+print(p_w)
+ggsave(file.path(OUT_DIR, "m3f_content_weights.png"), p_w, width = 8, height = 6, dpi = 150)
+```
+
+---
+
+## 10. Save
+
+```{r save}
+m3_results <- list(
+  metrics    = metrics,
+  train_tbl  = train_tbl,
+  scan       = scan_res,
+  lambda_c   = LAMBDA_C,
+  contrasts  = boot_tbl,
+  weights    = wt,
+  row_delta  = D,
+  strata_n   = test[, .N, by = nm_band][order(nm_band)],
+  meta = list(built = Sys.time(), n_boot = N_BOOT, seed = SEED,
+              feature_version = feat$meta$version,
+              n_features = nF, excluded = feat$meta$excluded))
+saveRDS(m3_results, file.path(CACHE_M3, "m3_results.rds"))
+fwrite(metrics, file.path(OUT_DIR, "m3_vs_m2e_comparison.csv"))
+cat("06b COMPLETE.\n")
+```
+
+---
+
+## 11. Limitations Specific to M3
+
+- **The content term is collinear with $b_i$ and $q_i$ by construction.**
+  Any gain is a regularisation effect, not new capacity. This is the
+  intended mechanism, but it means M3 cannot be described as "adding
+  information the model did not have"; it re-aims the shrinkage.
+- **`lambda_c` is tuned but M2e's `lambda` is not re-tuned alongside it.**
+  A joint scan might find a different optimum for the pair. The
+  single-axis scan is the price of keeping the M2e comparison clean.
+- **The sparsest stratum here is 10–20 ratings**, because the selection
+  prunes at $N_m \ge 10$. Pilászy and Tikk place the ratings-vs-metadata
+  crossover at about ten ratings, so this design cannot observe the
+  regime where content is predicted to dominate. That is what the
+  Phase B reselection at lower $N_m$ is for, and this limitation is the
+  reason it is not optional.
+- **Text features are a TF-IDF/SVD bag of words.** Kim et al. report that
+  bag-of-words item models add almost nothing over plain MF on dense
+  MovieLens (CTR 0.8969 vs PMF 0.8971 on ML-1m) and attribute this to the
+  loss of word order. A contextual encoder might do better; that is out
+  of scope.

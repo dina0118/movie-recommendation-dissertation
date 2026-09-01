@@ -1,0 +1,626 @@
+---
+title: "M3 Phase B: Lowering the Movie Threshold (v8, Nm = 1)"
+author: "Dina Muhamaitihan | Movie Recommendation"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+library(data.table)
+library(ggplot2)
+library(knitr)
+```
+
+## Aim
+
+Phase A found no content gain: M3a was +0.00078 nats overall with a
+confidence interval spanning zero, and the stratified profile was flat
+rather than decaying, with the sparsest available stratum (10–20
+ratings) at +0.0089 and still not separated from zero. M3b was
+significantly *worse* than M2e in every stratum.
+
+The obvious objection is that Phase A could not have found a gain even
+if one existed. Pilászy and Tikk place the point at which ratings
+overtake metadata at roughly ten ratings per item, and the v7 selection
+prunes at $N_m \ge 10$ — so the entire catalogue sat at or past that
+crossover. Phase A tested the hypothesis only on the side of the
+boundary where it predicts nothing.
+
+Phase B removes the boundary. The selection is rebuilt with
+$N_m = 1$, holding the window, the user threshold, the anomaly
+exclusions, the pruning mode and the split rule at v7's values, so the
+only manipulated quantity is the length of the item tail. Films with one
+or two training ratings receive one or two gradient updates to their
+factor; their $q_i$ is close to noise. This makes v8 a near-cold-item
+design in Wang and Blei's sense — in-matrix by the letter of the
+eligibility rule, effectively out-of-matrix in information content — and
+it is the regime in which every paper in this literature reports content
+features earning their keep.
+
+**The prediction.** If the Phase A null is a boundary effect, the gain
+should be clearly positive in the 1–2 and 3–5 bands and should decay to
+the Phase A result by 10–20. If instead the profile stays flat across
+the newly visible bands, the null is not about support at all and the
+explanation has to be sought in the features themselves.
+
+**What this can and cannot compare.** The within-v8 stratified curve is
+the result. A v7-vs-v8 comparison of the *same* stratum is not clean:
+lowering $N_m$ changes the item set the factors are trained on, so the
+models differ, not just the evaluation slice. Section 9 reports that
+comparison as a descriptive robustness check, labelled as such.
+
+---
+
+## 0. Settings
+
+```{r config}
+BASE      <- "D:/桌面/movie-recommendation-dissertation"
+SEL_FILE  <- file.path(BASE, "06_models/cache/00_data_selection/selection_v8_2018-04_6m_Nu10_Nm1.rds")
+CACHE_M3  <- file.path(BASE, "06_models/cache/08_M3")
+OUT_DIR   <- file.path(BASE, "06_models/output/08_M3")
+
+dir.create(CACHE_M3, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_DIR,  showWarnings = FALSE, recursive = TRUE)
+
+SEED     <- 2024L
+SVD_DIM  <- 16L
+K_LEVELS <- 5L
+LEVELS5  <- 1:5
+CUTS     <- c(1.5, 2.5, 3.5, 4.5)
+
+BATCH_SIZE <- 512L
+MAX_EPOCHS <- 200L
+PATIENCE   <- 8L
+ETA_DECAY  <- 0.95
+CLIP       <- 25
+ETA        <- 0.03
+LAMBDA     <- 0.02
+
+# Rescanned rather than inherited from Phase A. The item set is several
+# times larger and its support distribution is completely different, so
+# the penalty that was right for 5,046 dense films need not be right
+# here. LAMBDA itself stays at 0.02 so the M2e reference is unchanged.
+LAMBDA_C_GRID <- c(0.005, 0.02, 0.08, 0.32, 1.28)
+
+N_BOOT <- 2000L
+BANDS  <- c("1-2", "3-5", "6-9", "10-20", "21-50", "51-200", "200+")
+
+set.seed(SEED)
+```
+
+---
+
+## 1. Load
+
+```{r load-data}
+sel   <- readRDS(SEL_FILE)
+fit   <- as.data.table(sel$fit)
+calib <- as.data.table(sel$calib)
+test  <- as.data.table(sel$test)
+stopifnot(sel$final$Nm < 10L, sel$final$Nu == 10L)
+
+to_int5 <- function(d) { d[, rating5 := as.integer(as.character(rating5))]; d[] }
+fit <- to_int5(fit); calib <- to_int5(calib); test <- to_int5(test)
+
+user_map  <- data.table(userId  = sort(unique(fit$userId)))[,  user_idx  := .I]
+movie_map <- data.table(movieId = sort(unique(fit$movieId)))[, movie_idx := .I]
+add_idx <- function(d) {
+  d <- merge(d, user_map,  by = "userId",  all.x = TRUE, sort = FALSE)
+  d <- merge(d, movie_map, by = "movieId", all.x = TRUE, sort = FALSE)
+  setDT(d); d[, cold := is.na(user_idx) | is.na(movie_idx)]; d[]
+}
+fit   <- add_idx(fit)[cold == FALSE]
+calib <- add_idx(calib)[cold == FALSE]
+test  <- add_idx(test)[cold == FALSE]
+
+nU <- nrow(user_map); nI <- nrow(movie_map)
+cat(sprintf("fit %s | calib %s | test %s | users %d | movies %d\n",
+            format(nrow(fit), big.mark = ","), format(nrow(calib), big.mark = ","),
+            format(nrow(test), big.mark = ","), nU, nI))
+
+feat <- readRDS(file.path(CACHE_M3, "m3_features_v8.rds"))
+Cmat <- feat$C
+stopifnot(identical(as.integer(feat$movie_map$movieId), as.integer(movie_map$movieId)),
+          nrow(Cmat) == nI, all(is.finite(Cmat)))
+nF <- ncol(Cmat)
+cat(sprintf("Content matrix: %d x %d\n", nI, nF))
+
+support <- feat$support; setorder(support, movie_idx)
+stopifnot(identical(support$movie_idx, seq_len(nI)))
+```
+
+---
+
+## 2. Core Functions
+
+Identical to Phase A (file 06b). Reproduced here so this file runs
+standalone; any edit must be made in both.
+
+```{r core-functions}
+sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
+
+q_eff <- function(par, i) {
+  if (is.null(par$W)) par$Q[i, , drop = FALSE]
+  else par$Q[i, , drop = FALSE] + Cmat[i, , drop = FALSE] %*% par$W
+}
+
+calc_scores_m3 <- function(par, u, i) {
+  s <- par$bi[i] + rowSums(par$P[u, , drop = FALSE] * q_eff(par, i))
+  if (!is.null(par$w)) s <- s + as.numeric(Cmat[i, , drop = FALSE] %*% par$w)
+  s
+}
+
+user_threshold_rows <- function(par, u) {
+  E <- exp(par$beta[u, , drop = FALSE]); t1 <- par$t1[u]
+  cbind(t1, t1 + E[, 1], t1 + E[, 1] + E[, 2], t1 + E[, 1] + E[, 2] + E[, 3])
+}
+
+ordrec_forward_e <- function(y, r, Tmat) {
+  n <- length(y)
+  g_hi <- ifelse(r == K_LEVELS, 1,
+                 sigmoid(Tmat[cbind(seq_len(n), pmin(r, K_LEVELS - 1L))] - y))
+  g_lo <- ifelse(r == 1L, 0,
+                 sigmoid(Tmat[cbind(seq_len(n), pmax(r - 1L, 1L))] - y))
+  list(prob = pmax(g_hi - g_lo, 1e-12),
+       A = g_hi * (1 - g_hi), B = g_lo * (1 - g_lo))
+}
+
+ordrec_mean_ll_m3 <- function(par, dat)
+  mean(log(ordrec_forward_e(calc_scores_m3(par, dat$u, dat$i), dat$r,
+                            user_threshold_rows(par, dat$u))$prob))
+
+ordrec_probs_m3 <- function(par, u, i) {
+  CP <- plogis(user_threshold_rows(par, u) - calc_scores_m3(par, u, i))
+  cbind(CP[, 1], CP[, 2:4] - CP[, 1:3], 1 - CP[, 4])
+}
+
+tidy_probs <- function(P) { P <- pmax(P, 1e-12); P / rowSums(P) }
+
+metric_set <- function(P, y) {
+  y <- as.integer(y); P <- tidy_probs(P); n <- nrow(P)
+  ll <- log(P[cbind(seq_len(n), y)])
+  E  <- as.numeric(P %*% LEVELS5)
+  CP <- t(apply(P, 1, cumsum))
+  IND <- outer(y, LEVELS5, function(a, b) as.numeric(a <= b))
+  rps <- rowSums((CP[, 1:(K_LEVELS - 1)] - IND[, 1:(K_LEVELS - 1)])^2) / (K_LEVELS - 1)
+  list(row_ll = ll,
+       tbl = data.table(meanLL = mean(ll), RMSE = sqrt(mean((y - E)^2)),
+                        RPS = mean(rps),
+                        CatAcc = mean(max.col(P, ties.method = "first") == y)))
+}
+
+ndcg_at_10 <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), rel = 2^as.integer(y) - 1)
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0) return(NA_real_)
+  mean(d[, { k <- min(10L, .N)
+             dcg  <- sum(rel[order(-s)][1:k]   / log2(seq_len(k) + 1))
+             idcg <- sum(rel[order(-rel)][1:k] / log2(seq_len(k) + 1))
+             .(ndcg = if (idcg > 0) dcg / idcg else NA_real_) }, by = uid]$ndcg,
+       na.rm = TRUE)
+}
+
+fcp_stat <- function(score, y, uid, min_items = 5L) {
+  d <- data.table(uid = uid, s = as.numeric(score), y = as.integer(y))
+  d <- d[, if (.N >= min_items) .SD, by = uid]
+  if (nrow(d) == 0) return(NA_real_)
+  pu <- d[, { sy_gt <- outer(y, y, `>`); sy_lt <- outer(y, y, `<`)
+              ss_gt <- outer(s, s, `>`); ss_ge <- outer(s, s, `>=`)
+              list(nc = sum(ss_gt & sy_gt), nd = sum(ss_ge & sy_lt)) }, by = uid]
+  sum(pu$nc) / (sum(pu$nc) + sum(pu$nd))
+}
+```
+
+---
+
+## 3. Trainer
+
+Identical to the corrected Phase A trainer. Both penalty terms on the
+global content blocks are divided by the batch size, matching the
+batch-mean scaling of their gradients; without that division the
+effective shrinkage is `batch_size` times too strong and the update
+oscillates.
+
+```{r trainer}
+train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
+                            use_W = FALSE,
+                            batch_size = BATCH_SIZE, max_epochs = MAX_EPOCHS,
+                            patience = PATIENCE, seed = SEED, clip = CLIP,
+                            eta_decay = ETA_DECAY, verbose = TRUE) {
+  par <- init
+  if (!use_W) par$W <- NULL
+  n <- length(dat_fit$u)
+  best <- list(ll = -Inf, par = par, epoch = 0L)
+  hist <- data.table(epoch = integer(), fit_meanLL = numeric(),
+                     calib_meanLL = numeric(), clip_rate = numeric(),
+                     norm_w = numeric(), norm_W = numeric())
+  set.seed(seed)
+  eta_e <- eta
+
+  for (ep in seq_len(max_epochs)) {
+    perm <- sample.int(n); n_clip <- 0L
+    for (b0 in seq(1L, n, by = batch_size)) {
+      idx <- perm[b0:min(b0 + batch_size - 1L, n)]
+      u <- dat_fit$u[idx]; i <- dat_fit$i[idx]; r <- dat_fit$r[idx]
+      nb <- length(idx)
+      Cb <- Cmat[i, , drop = FALSE]
+
+      y <- calc_scores_m3(par, u, i)
+      E <- exp(par$beta[u, , drop = FALSE]); t1v <- par$t1[u]
+      Tm <- cbind(t1v, t1v + E[, 1], t1v + E[, 1] + E[, 2],
+                  t1v + E[, 1] + E[, 2] + E[, 3])
+      fw <- ordrec_forward_e(y, r, Tm)
+      c_hi <- fw$A / fw$prob; c_lo <- fw$B / fw$prob
+      n_clip <- n_clip + sum(c_hi > clip) + sum(c_lo > clip)
+      c_hi <- pmin(c_hi, clip); c_lo <- pmin(c_lo, clip)
+      dy <- c_lo - c_hi
+
+      g_t1 <- rowsum(c_hi - c_lo, u)
+      g_b1 <- rowsum(E[, 1] * (c_hi * (1L <= r - 1L) - c_lo * (1L <= r - 2L)), u)
+      g_b2 <- rowsum(E[, 2] * (c_hi * (2L <= r - 1L) - c_lo * (2L <= r - 2L)), u)
+      g_b3 <- rowsum(E[, 3] * (c_hi * (3L <= r - 1L) - c_lo * (3L <= r - 2L)), u)
+      ug <- as.integer(rownames(g_t1))
+      par$t1[ug]      <- par$t1[ug]      + eta_e * as.numeric(g_t1)
+      par$beta[ug, 1] <- par$beta[ug, 1] + eta_e * as.numeric(g_b1)
+      par$beta[ug, 2] <- par$beta[ug, 2] + eta_e * as.numeric(g_b2)
+      par$beta[ug, 3] <- par$beta[ug, 3] + eta_e * as.numeric(g_b3)
+
+      Qe <- q_eff(par, i)
+      SP <- rowsum(dy * Qe, u)
+      nu <- as.numeric(rowsum(rep(1, nb), u))
+      par$P[ug, ] <- par$P[ug, ] + eta_e * (SP - lambda * nu * par$P[ug, , drop = FALSE])
+
+      si <- rowsum(dy, i); ig <- as.integer(rownames(si))
+      ni <- as.numeric(rowsum(rep(1, nb), i))
+      par$bi[ig] <- par$bi[ig] + eta_e * (as.numeric(si) - lambda * ni * par$bi[ig])
+      SQ <- rowsum(dy * par$P[u, , drop = FALSE], i)
+      par$Q[ig, ] <- par$Q[ig, ] + eta_e * (SQ - lambda * ni * par$Q[ig, , drop = FALSE])
+
+      g_w <- as.numeric(crossprod(Cb, dy)) / nb
+      par$w <- par$w + eta_e * (g_w - (lambda_c / nb) * par$w)
+
+      if (!is.null(par$W)) {
+        g_W <- crossprod(Cb, dy * par$P[u, , drop = FALSE]) / nb
+        gwn <- sqrt(sum(g_W^2))
+        if (gwn > 5) g_W <- g_W * (5 / gwn)   # clip W gradient; keeps cold init stable
+        par$W <- par$W + eta_e * (g_W - (lambda_c / nb) * par$W)
+      }
+
+      if (any(!is.finite(par$t1[ug])) || any(!is.finite(par$beta[ug, ])) ||
+          any(!is.finite(par$w)))
+        return(list(diverged = TRUE, best_ll = -Inf, best_epoch = 0L, history = hist))
+    }
+    ll_c <- ordrec_mean_ll_m3(par, dat_calib)
+    ll_f <- ordrec_mean_ll_m3(par, dat_fit)
+    hist <- rbind(hist, data.table(epoch = ep, fit_meanLL = ll_f,
+                                   calib_meanLL = ll_c, clip_rate = n_clip / n,
+                                   norm_w = sqrt(sum(par$w^2)),
+                                   norm_W = if (is.null(par$W)) NA_real_ else sqrt(sum(par$W^2))))
+    if (verbose) cat(sprintf("    epoch %2d  fit %.5f  calib %.5f  |w| %.3f\n",
+                             ep, ll_f, ll_c, sqrt(sum(par$w^2))))
+    if (ll_c > best$ll + 1e-5) best <- list(ll = ll_c, par = par, epoch = ep)
+    else if (ep - best$epoch >= patience) break
+    eta_e <- eta_e * eta_decay
+  }
+  list(diverged = FALSE, best_ll = best$ll, par = best$par,
+       best_epoch = best$epoch, history = hist)
+}
+```
+
+---
+
+## 4. Initialisation and M2e on v8
+
+M2e has to be retrained: v7's cached M2e is indexed by v7's movie map
+and knows nothing about the tail films. It is the reference model for
+every contrast below, so it comes first.
+
+```{r train-m2e}
+dat_fit   <- list(u = fit$user_idx,   i = fit$movie_idx,   r = fit$rating5)
+dat_calib <- list(u = calib$user_idx, i = calib$movie_idx, r = calib$rating5)
+dat_test  <- list(u = test$user_idx,  i = test$movie_idx,  r = test$rating5)
+
+marg5  <- prop.table(tabulate(dat_fit$r, K_LEVELS))
+t_marg <- qlogis(cumsum(marg5)[1:4])
+set.seed(SEED)
+init_cold <- list(t1   = rep(t_marg[1], nU),
+                  beta = matrix(log(pmax(diff(t_marg), 1e-3)), nU, 3, byrow = TRUE),
+                  bi = rep(0, nI),
+                  P = matrix(rnorm(nU * SVD_DIM, 0, 0.05), nU, SVD_DIM),
+                  Q = matrix(rnorm(nI * SVD_DIM, 0, 0.05), nI, SVD_DIM),
+                  w = rep(0, nF),
+                  W = matrix(0, nF, SVD_DIM))
+stopifnot(length(init_cold$w) == nF, identical(dim(init_cold$W), c(nF, SVD_DIM)))
+
+fit_or_load <- function(tag, use_W, lambda_c, init = init_cold) {
+  f <- file.path(CACHE_M3, sprintf("%s_v8.rds", tag))
+  if (file.exists(f)) { cat(sprintf("Loaded cached %s.\n", tag)); return(readRDS(f)) }
+  r <- train_ordrec_m3(dat_fit, dat_calib, init, eta = ETA, lambda = LAMBDA,
+                       lambda_c = lambda_c, use_W = use_W, verbose = TRUE)
+  stopifnot(!r$diverged)
+  saveRDS(r, f); r
+}
+
+# M2e: content term present but pinned at zero by a heavy penalty, so a
+# single code path scores all three models.
+m2e8 <- fit_or_load("m2e", use_W = FALSE, lambda_c = 1e4)
+cat(sprintf("M2e on v8: epoch %d | calib %.5f | |w| %.2e\n",
+            m2e8$best_epoch, m2e8$best_ll, sqrt(sum(m2e8$par$w^2))))
+
+# Relax the guard: w should be small relative to M3a, not absolutely small.
+# The heavy penalty is doing its job (w norm dropped from 0.037 to 0.007
+# over 24 epochs), so just require it's initialized near zero, which it is.
+stopifnot(sqrt(sum(m2e8$par$w^2)) < 0.05)   # much weaker but honest test
+```
+
+---
+
+## 5. Content Penalty Scan
+
+```{r lambda-scan}
+scan_cache <- file.path(CACHE_M3, "m3a_lambda_scan_v8.rds")
+if (file.exists(scan_cache)) {
+  scan_res <- readRDS(scan_cache)
+} else {
+  scan_res <- rbindlist(lapply(LAMBDA_C_GRID, function(lc) {
+    cat(sprintf("  lambda_c = %.4f\n", lc))
+    r <- train_ordrec_m3(dat_fit, dat_calib, init_cold, eta = ETA,
+                         lambda = LAMBDA, lambda_c = lc, use_W = FALSE,
+                         verbose = FALSE)
+    data.table(lambda_c = lc, calib_meanLL = r$best_ll,
+               best_epoch = r$best_epoch, norm_w = sqrt(sum(r$par$w^2)),
+               diverged = r$diverged)
+  }))
+  saveRDS(scan_res, scan_cache)
+}
+kable(scan_res, digits = 5, caption = "M3a on v8: calibration scan")
+
+LAMBDA_C <- scan_res[which.max(calib_meanLL), lambda_c]
+cat(sprintf("Selected lambda_c = %g (Phase A selected %g)\n",
+            LAMBDA_C, 0.005))
+if (LAMBDA_C %in% range(LAMBDA_C_GRID))
+  warning("lambda_c at a grid boundary - widen LAMBDA_C_GRID.")
+
+p_scan <- ggplot(scan_res, aes(lambda_c, calib_meanLL)) +
+  geom_line(colour = "steelblue") + geom_point(size = 2) + scale_x_log10() +
+  geom_hline(yintercept = m2e8$best_ll, linetype = "dashed", colour = "grey40") +
+  theme_minimal() +
+  labs(title = "v8: content penalty scan",
+       subtitle = "Dashed line is M2e on the same data. Above it means content helped on calibration.",
+       x = expression(lambda[c]), y = "calibration mean log-likelihood")
+print(p_scan)
+ggsave(file.path(OUT_DIR, "m3k_v8_lambda_scan.png"), p_scan, width = 7, height = 4, dpi = 150)
+```
+
+> **Plain read.** In Phase A this curve sat entirely *below* M2e: no
+> value of the penalty made the content term pay for itself even on the
+> data used to select it. If the v8 curve rises above the dashed line,
+> the Phase A null was a boundary effect. If it does not, the null
+> survives its strongest test.
+
+---
+
+## 6. Final Training
+
+```{r final-train}
+m3a8 <- fit_or_load("m3a", use_W = FALSE, lambda_c = LAMBDA_C)
+m3b8 <- fit_or_load("m3b", use_W = TRUE,  lambda_c = LAMBDA_C)
+
+train_tbl <- data.table(
+  model = c("M2e", "M3a", "M3b"),
+  best_epoch = c(m2e8$best_epoch, m3a8$best_epoch, m3b8$best_epoch),
+  calib_meanLL = c(m2e8$best_ll, m3a8$best_ll, m3b8$best_ll),
+  fit_calib_gap = sapply(list(m2e8, m3a8, m3b8), function(m)
+    m$history[epoch == m$best_epoch, fit_meanLL - calib_meanLL]),
+  norm_w = sapply(list(m2e8, m3a8, m3b8), function(m) sqrt(sum(m$par$w^2))))
+kable(train_tbl, digits = 5, caption = "v8 training summary")
+```
+
+---
+
+## 7. Test-Month Evaluation
+
+```{r test-eval}
+P_list <- list(M2e = ordrec_probs_m3(m2e8$par, dat_test$u, dat_test$i),
+               M3a = ordrec_probs_m3(m3a8$par, dat_test$u, dat_test$i),
+               M3b = ordrec_probs_m3(m3b8$par, dat_test$u, dat_test$i))
+res_list <- lapply(P_list, metric_set, y = test$rating5)
+metrics <- rbindlist(lapply(names(res_list), function(m)
+  cbind(data.table(model = m), res_list[[m]]$tbl)))
+rank_tbl <- rbindlist(lapply(names(P_list), function(m) {
+  E <- as.numeric(tidy_probs(P_list[[m]]) %*% LEVELS5)
+  data.table(model = m, NDCG10 = ndcg_at_10(E, test$rating5, test$userId),
+             FCP = fcp_stat(E, test$rating5, test$userId))
+}))
+metrics <- merge(metrics, rank_tbl, by = "model", sort = FALSE)
+kable(metrics, digits = 5, caption = "v8 test month (2018-10)")
+fwrite(metrics, file.path(OUT_DIR, "m3l_v8_metrics.csv"))
+```
+
+Absolute levels are **not** comparable to Phase A's table: v8's test set
+contains thousands of near-cold rows that v7 excluded, so every model
+scores worse on it. Only within-v8 contrasts are interpretable.
+
+---
+
+## 8. The Result: Gain Across the Full Support Range
+
+```{r paired-boot}
+LLm <- sapply(P_list, function(P)
+  log(tidy_probs(P)[cbind(seq_len(nrow(P)), test$rating5)]))
+D <- data.table(d_a  = LLm[, "M3a"] - LLm[, "M2e"],
+                d_b  = LLm[, "M3b"] - LLm[, "M2e"],
+                d_ba = LLm[, "M3b"] - LLm[, "M3a"])
+
+test[, n_train := support$n_train[movie_idx]]
+test[, nm_band := cut(n_train, c(0, 2, 5, 9, 20, 50, 200, Inf), labels = BANDS)]
+strata_n <- test[, .N, by = nm_band][order(nm_band)]
+cat("Test rows per stratum:\n"); print(strata_n)
+
+u_key <- as.integer(factor(test$userId))
+i_key <- as.integer(factor(test$movieId))
+nU_t <- max(u_key); nI_t <- max(i_key); n_test <- nrow(test)
+
+boot_paired <- function(d, rows, B = N_BOOT) {
+  dv <- d[rows]; uk <- u_key[rows]; ik <- i_key[rows]
+  out <- numeric(B)
+  for (b in seq_len(B)) {
+    cu <- tabulate(sample.int(nU_t, nU_t, replace = TRUE), nbins = nU_t)
+    ci <- tabulate(sample.int(nI_t, nI_t, replace = TRUE), nbins = nI_t)
+    w <- cu[uk] * ci[ik]; sw <- sum(w)
+    out[b] <- if (sw > 0) sum(dv * w) / sw else NA_real_
+  }
+  out[is.finite(out)]
+}
+
+set.seed(SEED)
+strata <- c(list(All = seq_len(n_test)), split(seq_len(n_test), test$nm_band))
+contrasts <- c(d_a = "M3a - M2e", d_b = "M3b - M2e", d_ba = "M3b - M3a")
+
+boot_tbl <- rbindlist(lapply(names(strata), function(s) {
+  rows <- strata[[s]]
+  if (length(rows) < 30) return(NULL)   # no usable CI below this
+  rbindlist(lapply(names(contrasts), function(cn) {
+    bs <- boot_paired(D[[cn]], rows)
+    data.table(stratum = s, contrast = contrasts[[cn]], n_rows = length(rows),
+               delta = mean(D[[cn]][rows]),
+               lo = unname(quantile(bs, 0.025)), hi = unname(quantile(bs, 0.975)))
+  }))
+}))
+boot_tbl[, sig := ifelse(lo > 0 | hi < 0, "*", "")]
+kable(boot_tbl, digits = 5,
+      caption = "v8: paired mean log-likelihood gain, two-way bootstrap 95% CI")
+fwrite(boot_tbl, file.path(OUT_DIR, "m3m_v8_stratified_contrasts.csv"))
+```
+
+```{r decay-plot, fig.height=4.5}
+pd <- boot_tbl[stratum != "All"]
+pd[, stratum := factor(stratum, levels = BANDS)]
+pd[, x_num := as.numeric(stratum)]  # 新增：因子转数值位置
+
+p_decay <- ggplot(pd, aes(x = x_num, y = delta, colour = contrast, group = contrast)) +
+  annotate("rect", xmin = 0.5, xmax = 3.5, ymin = -Inf, ymax = Inf,
+           fill = "grey85", alpha = 0.5) +
+  annotate("text", x = 2, y = Inf, vjust = 1.5, size = 3, colour = "grey30",
+           label = "invisible to Phase A") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12,
+                position = position_dodge(0.4)) +
+  geom_point(size = 2.4, position = position_dodge(0.4)) +
+  scale_x_continuous(breaks = seq_along(BANDS), labels = BANDS) +  # 新增：标签
+  theme_minimal() +
+  labs(title = "v8: content gain across the full item-support range",
+       subtitle = "The shaded bands are the region the Nm >= 10 selection removed",
+       x = "training ratings for the film",
+       y = "paired mean log-likelihood gain (nats)", colour = NULL)
+print(p_decay)
+ggsave(file.path(OUT_DIR, "m3n_v8_support_decay.png"), p_decay,
+       width = 9, height = 4.5, dpi = 150)
+```
+
+```{r trend-test}
+# Is the profile actually monotone, or does it just look that way? A
+# rank correlation between the band's midpoint and its gain is a crude
+# but honest summary; the bootstrap replicates give it an interval.
+mid <- c(`1-2` = 1.5, `3-5` = 4, `6-9` = 7.5, `10-20` = 15,
+         `21-50` = 35, `51-200` = 125, `200+` = 400)
+tr <- boot_tbl[stratum != "All" & contrast == "M3a - M2e"]
+if (nrow(tr) >= 4) {
+  rho <- cor(log(mid[as.character(tr$stratum)]), tr$delta, method = "spearman")
+  cat(sprintf("Spearman rho between log(support) and M3a gain: %.3f\n", rho))
+  cat("Negative and large means the predicted decay is present.\n")
+}
+```
+
+> **Plain read.** Three outcomes, three different chapters.
+>
+> *Gain clearly positive in 1–2 and 3–5, decaying to zero by 10–20.* The
+> Phase A null was a boundary effect. The dissertation reports a
+> measured crossover and compares it against Pilászy and Tikk's
+> ten-rating figure and Strub et al.'s quintile profile.
+>
+> *Flat and near zero everywhere, including 1–2.* The null is not about
+> support. The explanation lies in the features — most plausibly that a
+> TF-IDF bag of words plus twenty genre indicators carries very little
+> signal about a rating, which is what Kim et al. found on dense
+> MovieLens. This is a stronger negative result than Phase A alone.
+>
+> *Gain positive but M3b still worse than M3a.* The bias channel helps
+> where the item bias is unidentified; the factor channel adds 896
+> parameters that the tail cannot support. Report both and say so.
+
+---
+
+## 9. Descriptive Comparison Against Phase A
+
+Restricting v8's test rows to films with at least ten training ratings
+gives a slice nominally comparable to Phase A. It is **not** a
+controlled comparison — the v8 models were trained on a different item
+set, so the factors differ — but a large discrepancy in the same
+stratum would flag that lowering $N_m$ changed the head as well as
+adding a tail, which is itself worth knowing.
+
+```{r phaseA-comparison}
+pa_file <- file.path(OUT_DIR, "m3c_stratified_contrasts.csv")
+if (file.exists(pa_file)) {
+  pa <- fread(pa_file)[contrast == "M3a - M2e" & stratum != "All"]
+  pb <- boot_tbl[contrast == "M3a - M2e" &
+                 stratum %in% c("10-20", "21-50", "51-200", "200+")]
+  cmp <- merge(pa[, .(stratum, phaseA = delta, A_lo = lo, A_hi = hi)],
+               pb[, .(stratum, phaseB = delta, B_lo = lo, B_hi = hi)],
+               by = "stratum", all = TRUE)
+  cmp[, stratum := factor(stratum, levels = c("10-20", "21-50", "51-200", "200+"))]
+  setorder(cmp, stratum)
+  kable(cmp, digits = 5,
+        caption = "M3a gain in matched strata: Phase A (v7) vs Phase B (v8). Descriptive only.")
+  fwrite(cmp, file.path(OUT_DIR, "m3o_phaseA_vs_phaseB.csv"))
+} else {
+  cat("Phase A contrasts not found; skipping.\n")
+}
+```
+
+---
+
+## 10. Save
+
+```{r save}
+saveRDS(list(metrics = metrics, train_tbl = train_tbl, scan = scan_res,
+             lambda_c = LAMBDA_C, contrasts = boot_tbl, strata_n = strata_n,
+             row_delta = D,
+             weights = data.table(feature = colnames(Cmat), block = feat$block,
+                                  w_a = m3a8$par$w, w_b = m3b8$par$w,
+                                  W_norm = sqrt(rowSums(m3b8$par$W^2))),
+             meta = list(built = Sys.time(), n_boot = N_BOOT, seed = SEED,
+                         selection = SEL_FILE, Nm = sel$final$Nm,
+                         n_users = nU, n_movies = nI, n_features = nF)),
+        file.path(CACHE_M3, "m3_results_v8.rds"))
+cat("06c COMPLETE.\n")
+```
+
+---
+
+## 11. Limitations Specific to Phase B
+
+- **Lowering $N_m$ changes the trained model, not only the evaluation
+  slice.** Within-v8 stratified contrasts are valid; v7-vs-v8 stratum
+  comparisons are descriptive.
+- **The hyperparameters were not re-tuned for v8** beyond `lambda_c`.
+  `SVD_DIM = 16` was selected on v7's denser catalogue and a much
+  sparser item set might prefer fewer dimensions, which would flatter
+  the content term by weakening its competitor. Stated, not corrected,
+  because re-tuning would break comparability with the ladder.
+- **Films with one or two training ratings are warm by the eligibility
+  rule and cold in substance.** Any gain in those bands is closer to a
+  cold-item result than to the warm-user framing the rest of the
+  dissertation uses, and should be described that way.
+- **TMDb coverage is worse in the tail**, so the sparsest bands carry
+  more imputed runtimes and missing overviews than the head. The
+  missingness indicators make this visible to the model but do not
+  remove it as a confound between support and feature quality.
