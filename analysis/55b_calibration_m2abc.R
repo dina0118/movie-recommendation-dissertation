@@ -1,39 +1,5 @@
 # =====================================================================
 # 55b_calibration_m2abc.R
-#
-# 55 computed the replacement calibration measures for M1, M2d, M2d+T,
-# M2e and the three M3 fits, but not for M2a, M2b and M2c. Every
-# calibration claim in the thesis that says "all six models" or "the
-# only model in the ladder" therefore rests on a table with three rungs
-# missing. This file fills them in.
-#
-# RUN INSIDE THE SAME CLEAN 06b SESSION, IMMEDIATELY AFTER 55.
-# It reuses 55's bootstrap weight matrix h_W, so the new intervals are
-# paired with the existing ones rather than drawn independently.
-#
-# ---------------------------------------------------------------------
-# WHY THE MODELS ARE REFITTED RATHER THAN LOADED
-#
-# m1_m2_results.rds stores the metrics table and the threshold table but
-# not the clm/clmm2 objects, so P_m2a, P_m2b and P_m2c cannot be
-# reconstructed from cache alone. They are refitted here on the same
-# calibration set from the same frozen SVD factors, and then checked
-# against the cache in two independent ways before anything is computed:
-#
-#   (1) the refitted thresholds against h_r7$thresholds
-#   (2) the refitted test mean log-likelihood against h_r7$metrics
-#
-# If either guard fires, the refit is not the model the thesis reports
-# and the calibration numbers below would be numbers for a different
-# model. Do not widen the tolerances. Diagnose in this order: the row
-# count of calib, whether the SVD score is the unclipped one, and the
-# random-intercept coverage printed for M2c.
-#
-# TWO DETAILS THAT ARE EASY TO GET WRONG, BOTH TAKEN FROM 07
-#
-#   - M1 scores the CLIPPED SVD score, M2a-M2c score the UNCLIPPED one.
-#   - M2c evaluates test users with no calibration history at a random
-#     intercept of zero.
 # =====================================================================
 
 suppressPackageStartupMessages({
