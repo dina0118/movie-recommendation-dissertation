@@ -1,20 +1,5 @@
 # =====================================================================
-# 16_ten_month_evaluation.R  --  Task 4: fixed training, rolling test
-#
-# Run INSIDE the file-11 session, after section 5, like scripts 12-15b.
-# It needs from that session:
-#   user_map, movie_map, test, Pmat, Qmat, sigma_m1,
-#   th_a, b_a, th_b, b_b, m2c_par, m2d, m2e,
-#   gauss_probs, cum_probs, ordrec_probs_d, ordrec_probs_e,
-#   metric_set, tidy_probs, ndcg_per_user, fcp_stat,
-#   CUTS, LEVELS5, K_LEVELS, SEED, N_BOOT,
-#   MODEL_LEVELS, MODEL_COLS, theme_pub, save_fig, OUT_DIR
-#
-# Nothing is retrained. Every model is frozen at the parameters fitted
-# on 2018-04..09; only the evaluation window moves. Ten monthly test
-# sets, 2018-10 through 2019-07, are re-sliced from the raw MovieLens
-# cache because selection_v7 stores 2018-10 only.
-#
+# 16_ten_month_evaluation.R  
 # Three things are measured, and they answer different questions:
 #   (A) all eligible rows per month      -- the deployment-realistic view
 #   (B) balanced panel (users in all 10) -- isolates model staleness from
