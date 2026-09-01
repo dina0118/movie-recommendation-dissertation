@@ -2,84 +2,8 @@
 # 08_M2d_gradient_check.R
 # M2d (joint OrdRec, global thresholds): log-likelihood, analytic gradient,
 # numerical gradient check, and a cross-check against ordinal::clm.
-#
-# THIS FILE TRAINS NOTHING. It is the verification stage agreed before any
-# SGD is written: no result from the joint model is believed until
-#   (1) the analytic gradient matches a numerical gradient to ~6 decimals, and
-#   (2) with the factors frozen, maximising our likelihood reproduces the
-#       thresholds that ordinal::clm estimates for the same model.
-# The SGD training loop lives in the next file and imports nothing from here
-# except confidence.
-#
-# ----------------------------------------------------------------------------
-# THE MODEL (Koren & Sill, 2011, RecSys; equation numbers from that paper)
-#
-# Internal score for user u and item i (our deviation from the paper: the
-# paper wraps SVD++, eq. (3); we wrap plain matrix factorisation, dropping
-# the implicit-feedback term |R(u)|^{-1/2} * sum_j x_j):
-#
-#     y_ui = b_i + b_u + q_i' p_u                                      [eq. 3]
-#
-# S-1 = 4 ordered thresholds, monotone by construction [eqs. 4-5]:
-#
-#     t_1 free,   t_{r+1} = t_r + exp(beta_r),   r = 1, 2, 3
-#
-# Cumulative probabilities via the logistic link [eq. 9] (the paper motivates
-# this with a latent-variable story, z ~ N(y,1) in eqs. 6-8, then swaps the
-# probit for the logistic for convenience; our M1 is the Gaussian version of
-# the same construction with fixed thresholds):
-#
-#     g_k := P(r_ui <= k) = 1 / (1 + exp(y_ui - t_k)) = sigmoid(t_k - y_ui)
-#     g_0 = 0,  g_S = 1  (conventions t_0 = -Inf, t_S = +Inf)
-#
-# Category probability [eq. 10]:
-#
-#     P(r_ui = r) = g_r - g_{r-1}
-#
-# Log-likelihood of the training set [eq. 11]:
-#
-#     L = sum over observed (u,i,r) of log P(r_ui = r)
-#
-# ----------------------------------------------------------------------------
-# THE GRADIENT (paper eq. 12, unregularised part; the -lambda*theta term is
-# added later in the SGD file, not checked here because it is trivial)
-#
-# Write, for one observation with rating r:
-#     A := g_r     * (1 - g_r)        (A = 0 when r = S, since g_S = 1)
-#     B := g_{r-1} * (1 - g_{r-1})    (B = 0 when r = 1, since g_0 = 0)
-#     p := g_r - g_{r-1}
-#
-# Then, using d sigmoid(x)/dx = sigmoid(1 - sigmoid) and the chain rule,
-# for any parameter theta [eq. 12]:
-#
-#     dl/dtheta = (1/p) * [ A * d(t_r - y)/dtheta  -  B * d(t_{r-1} - y)/dtheta ]
-#
-# The two threshold terms enter WITH OPPOSITE SIGNS - the known easy mistake.
-# Specialising:
-#
-#   score side (d t / d theta = 0, d y / d theta as below):
-#     dl/dy    = (B - A) / p
-#     dl/db_u  = dl/dy,   dl/db_i = dl/dy
-#     dl/dp_u  = dl/dy * q_i,   dl/dq_i = dl/dy * p_u
-#
-#   threshold side (d y / d theta = 0). Since t_r = t_1 + sum_{s<r} exp(beta_s):
-#     d t_r / d t_1    = 1                       (any r in 1..4)
-#     d t_r / d beta_s = exp(beta_s) * 1[s <= r-1]   <- chain-rule exp factor
-#   hence
-#     dl/dt_1    = (A * 1[r <= 4]  -  B * 1[r >= 2]) / p
-#                = (A - B) / p            (A, B already zeroed at the edges)
-#     dl/dbeta_s = exp(beta_s) * (A * 1[s <= r-1] - B * 1[s <= r-2]) / p
-#
-# References:
-#   Koren, Y. and Sill, J. (2011) OrdRec: an ordinal model for predicting
-#     personalized item rating distributions. RecSys '11, pp. 117-124.
-#   McCullagh, P. (1980) Regression models for ordinal data. JRSS-B 42(2),
-#     pp. 109-142.  (The cumulative-link form that both OrdRec and
-#     ordinal::clm implement; the clm cross-check below leans on this
-#     equivalence: with y frozen, OrdRec IS a clm with offset(y) and slope 1.)
 # ============================================================================
 
-# --- edit these two paths (same as 07) --------------------------------------
 SEL_FILE  <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/00_data_selection/selection_v7_2018-04_6m_Nu10_Nm10.rds"
 CACHE_DIR <- "D:/桌面/movie-recommendation-dissertation/06_models/cache/07_M1_M2"
 # ----------------------------------------------------------------------------
@@ -90,7 +14,7 @@ SVD_DIM  <- 16L
 set.seed(SEED)
 
 # ============================================================================
-# PART 1 - Model functions (base R, shared with the SGD file later)
+# PART 1 - Model functions
 # ============================================================================
 
 # Thresholds from the unconstrained parameterisation [eqs. 4-5].
@@ -250,11 +174,7 @@ cat(sprintf("Toy ratings per category: %s  (1 and 5 must both be > 0)\n\n",
 # fixed at 1), OrdRec eq. 9 IS McCullagh's cumulative logit model with an
 # offset:  logit P(Y <= k) = t_k - offset.  ordinal::clm fits exactly that
 # with clm(rating_f ~ 1 + offset(svd_score)).  So the four thresholds that
-# maximise OUR likelihood must agree with clm's estimates. This is a much
-# stronger test than the numerical gradient: it checks the likelihood itself
-# against an independent, widely-used MLE implementation, not just the
-# internal consistency of our own code.  (Supervisor's concern about
-# self-written code being easy to attack is answered by exactly this test.)
+# maximise OUR likelihood must agree with clm's estimates. 
 # ============================================================================
 
 cat("========== PART 3: frozen-factor cross-check vs ordinal::clm ==========\n")
@@ -287,7 +207,7 @@ if (!file.exists(SEL_FILE)) {
   fit <- add_idx(fit)[cold == FALSE]
   calib <- add_idx(calib)[cold == FALSE]
 
-  # --- SVD scores on calib (same settings as 07) ----------------------------
+  # --- SVD scores on calib ----------------------------
   # recosystem with >1 thread is not bit-for-bit reproducible, but that does
   # not matter here: whatever scores come out are frozen and BOTH sides of
   # the comparison see the same frozen scores.
