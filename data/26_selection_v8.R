@@ -8,16 +8,8 @@
 # unchanged and the only manipulated quantity is the length of the item
 # tail.
 #
-# SELF-VALIDATION. The same function is first run at Nm = 10 and its
-# output compared row-for-row against the stored v7 selection. If that
-# comparison fails, the rebuild is not faithful and the Nm = 1 output
-# must not be used. This is the whole reason the script is structured
-# this way rather than just pruning harder.
-#
 # Output: cache/00_data_selection/selection_v8_2018-04_6m_Nu10_Nm1.rds
-#         (same list structure as v7, so 05c/06c can read either)
-#
-# Runtime: ~2-4 minutes.
+
 # =====================================================================
 
 NM_NEW <- 1L          # the new movie threshold
