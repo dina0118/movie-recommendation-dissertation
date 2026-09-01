@@ -38,10 +38,21 @@ anything in `analysis/`.
 5. `content/` — feature construction, then the content-feature models
 6. `analysis/` — evaluation and figures, starting with
    `11_M2e_analysis_and_figures.Rmd`
+7. `analysis/55_calibration_inference.R`, then
+   `analysis/55b_calibration_m2abc.R` — the calibration measures
+   reported in Chapter 5 and Appendix B
 
-Several scripts in `analysis/` expect objects created by `11`, and expect the
-full six-model probability list to be in memory. Running a content-feature
-script overwrites that list, so run the content scripts last.
+Several scripts in `analysis/` expect objects created by `11`, and expect
+the full six-model probability list to be in memory. Running a
+content-feature script overwrites that list, so run the content scripts
+last.
+
+`55` and `55b` are the exception: both run inside a clean `06b` session,
+after `52` and `54`, and `55b` must run in the same session as `55`
+because it reuses the bootstrap weight matrix drawn there. `55b`
+refits M2a, M2b and M2c on the calibration set, which takes about eight
+minutes, and checks them against the cached thresholds and metrics of
+`07` before computing anything.
 
 ## Notes
 
