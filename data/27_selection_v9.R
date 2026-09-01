@@ -5,23 +5,7 @@
 # Nu 10 -> 30. Nm stays at 10, the window, anomaly exclusions, pruning
 # mode and split rule stay at v7's values. This is the mirror image of
 # Phase B: there the item tail was extended, here the user tail is cut.
-#
-# WHY THE RECONSTRUCTION IS VALID HERE. raw_study_period.rds is absent,
-# so the window is reassembled from v7's own parts, exactly as in 26.
-# For Phase B that required an argument about pipeline fidelity. Here it
-# does not: thresholds only INCREASE, and k-cores are nested, so the
-# (30,10)-core of the full window equals the (30,10)-core of the
-# (10,10)-core that v7 already stores. Re-pruning v7's training set is
-# therefore exact rather than approximate.
-#
-# WHAT THE GUARD DOES AND DOES NOT PROVE. Section 3 re-prunes at (10,10)
-# and checks the result is unchanged. That verifies idempotence and the
-# nesting argument. It does NOT re-derive v7 from raw ratings, so it is
-# a weaker check than the one in 26. Stated here so it is not mistaken
-# for a full reproduction.
-#
 # Output: cache/00_data_selection/selection_v9_2018-04_6m_Nu30_Nm10.rds
-# Runtime: ~1-2 minutes.
 # =====================================================================
 
 NU_NEW <- 30L         # the new user threshold
