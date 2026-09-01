@@ -5,33 +5,6 @@
 # Run INSIDE the file-11 session, after section 5, like 12-15b.
 # Needs: P_list, test, tidy_probs, LEVELS5, MODEL_LEVELS, MODEL_COLS,
 #        theme_pub, save_fig, OUT_DIR
-#
-# ---------------------------------------------------------------------
-# WHY THIS REPLACES p13 / p13b RATHER THAN ADDING TO THEM
-#
-# Three problems with the existing pair.
-#
-# (1) They show M1, M2d and M2e only. M2c carries a per-user random
-#     intercept b_u, so a reader will reasonably ask whether M2c already
-#     gives each user their own shape. It does not: b_u shifts the linear
-#     predictor eta = beta*y + b_u, and the five probabilities are
-#     sigma(Theta_k - eta), so the shape is still a function of one
-#     scalar. Leaving M2a-M2c out of the picture leaves that question
-#     open. Including them turns a three-way contrast into the complete
-#     statement: five of the six rungs are one-curve models, and only
-#     M2e is not.
-#
-# (2) They condition on expected ratings 3.0, 3.5 and 4.0 -- the middle
-#     of the scale, which is exactly where M1's discretisation skew is
-#     smallest. Read from those panels M1 looks symmetric, which appears
-#     to confirm the supervisor's premise; read over the whole test month
-#     it is not (median skew -0.155, 45.3% of rows above 0.25 in
-#     magnitude). Plotting against the point prediction over the full
-#     range shows why both readings arise and settles it.
-#
-# (3) The request was for a *simple* illustration. A jitter strip of
-#     16,694 rows is not one. Section 3 gives the plain version: the five
-#     bars, for one prediction, model by model.
 # =====================================================================
 
 suppressPackageStartupMessages({ library(data.table); library(ggplot2) })
@@ -111,11 +84,6 @@ fwrite(skew_tbl, file.path(OUT_DIR, "t5_skew_summary.csv"))
 # =====================================================================
 # 2. P33 -- the complete picture, six models, full range
 # =====================================================================
-# The five one-curve models are drawn as lines because their rows lie
-# exactly on a curve; drawing them as clouds would invite the reader to
-# see scatter that is not there. M2e is drawn as points because its rows
-# genuinely do not lie on a curve. The difference in geometry IS the
-# result, and the subtitle says so.
 
 curve_dat <- shape[model %in% ONE_CURVE][order(model, mean)]
 free_dat  <- shape[model == FREE]
@@ -188,12 +156,6 @@ print(p33b); save_fig("p33b_skew_all_models.png", p33b, w = 7.4, h = 4.4)
 # =====================================================================
 # 3. P34 -- the simple illustration
 # =====================================================================
-# The plain version of the same point: hold the expected rating at 3.5
-# and draw the five probabilities. One bar set per model. Because the
-# five one-curve models give the same answer to every row in the band,
-# any row will do for them. For M2e three rows are shown -- the most
-# confident, the median, and the most hedged -- because for M2e the row
-# matters and that is the whole claim.
 
 TARGET <- 3.5; HALFW <- 0.02
 pick <- rbindlist(lapply(MODEL_LEVELS, function(m) {
