@@ -18,44 +18,6 @@ library(ggplot2)
 library(knitr)
 ```
 
-## Aim
-
-Phase A found no content gain: M3a was +0.00078 nats overall with a
-confidence interval spanning zero, and the stratified profile was flat
-rather than decaying, with the sparsest available stratum (10–20
-ratings) at +0.0089 and still not separated from zero. M3b was
-significantly *worse* than M2e in every stratum.
-
-The obvious objection is that Phase A could not have found a gain even
-if one existed. Pilászy and Tikk place the point at which ratings
-overtake metadata at roughly ten ratings per item, and the v7 selection
-prunes at $N_m \ge 10$ — so the entire catalogue sat at or past that
-crossover. Phase A tested the hypothesis only on the side of the
-boundary where it predicts nothing.
-
-Phase B removes the boundary. The selection is rebuilt with
-$N_m = 1$, holding the window, the user threshold, the anomaly
-exclusions, the pruning mode and the split rule at v7's values, so the
-only manipulated quantity is the length of the item tail. Films with one
-or two training ratings receive one or two gradient updates to their
-factor; their $q_i$ is close to noise. This makes v8 a near-cold-item
-design in Wang and Blei's sense — in-matrix by the letter of the
-eligibility rule, effectively out-of-matrix in information content — and
-it is the regime in which every paper in this literature reports content
-features earning their keep.
-
-**The prediction.** If the Phase A null is a boundary effect, the gain
-should be clearly positive in the 1–2 and 3–5 bands and should decay to
-the Phase A result by 10–20. If instead the profile stays flat across
-the newly visible bands, the null is not about support at all and the
-explanation has to be sought in the features themselves.
-
-**What this can and cannot compare.** The within-v8 stratified curve is
-the result. A v7-vs-v8 comparison of the *same* stratum is not clean:
-lowering $N_m$ changes the item set the factors are trained on, so the
-models differ, not just the evaluation slice. Section 9 reports that
-comparison as a descriptive robustness check, labelled as such.
-
 ---
 
 ## 0. Settings
@@ -140,8 +102,6 @@ stopifnot(identical(support$movie_idx, seq_len(nI)))
 
 ## 2. Core Functions
 
-Identical to Phase A (file 06b). Reproduced here so this file runs
-standalone; any edit must be made in both.
 
 ```{r core-functions}
 sigmoid <- function(x) 1 / (1 + exp(-pmin(pmax(x, -30), 30)))
@@ -222,11 +182,6 @@ fcp_stat <- function(score, y, uid, min_items = 5L) {
 
 ## 3. Trainer
 
-Identical to the corrected Phase A trainer. Both penalty terms on the
-global content blocks are divided by the batch size, matching the
-batch-mean scaling of their gradients; without that division the
-effective shrinkage is `batch_size` times too strong and the update
-oscillates.
 
 ```{r trainer}
 train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
@@ -318,9 +273,6 @@ train_ordrec_m3 <- function(dat_fit, dat_calib, init, eta, lambda, lambda_c,
 
 ## 4. Initialisation and M2e on v8
 
-M2e has to be retrained: v7's cached M2e is indexed by v7's movie map
-and knows nothing about the tail films. It is the reference model for
-every contrast below, so it comes first.
 
 ```{r train-m2e}
 dat_fit   <- list(u = fit$user_idx,   i = fit$movie_idx,   r = fit$rating5)
@@ -399,12 +351,6 @@ print(p_scan)
 ggsave(file.path(OUT_DIR, "m3k_v8_lambda_scan.png"), p_scan, width = 7, height = 4, dpi = 150)
 ```
 
-> **Plain read.** In Phase A this curve sat entirely *below* M2e: no
-> value of the penalty made the content term pay for itself even on the
-> data used to select it. If the v8 curve rises above the dashed line,
-> the Phase A null was a boundary effect. If it does not, the null
-> survives its strongest test.
-
 ---
 
 ## 6. Final Training
@@ -443,10 +389,6 @@ metrics <- merge(metrics, rank_tbl, by = "model", sort = FALSE)
 kable(metrics, digits = 5, caption = "v8 test month (2018-10)")
 fwrite(metrics, file.path(OUT_DIR, "m3l_v8_metrics.csv"))
 ```
-
-Absolute levels are **not** comparable to Phase A's table: v8's test set
-contains thousands of near-cold rows that v7 excluded, so every model
-scores worse on it. Only within-v8 contrasts are interpretable.
 
 ---
 
@@ -539,33 +481,9 @@ if (nrow(tr) >= 4) {
 }
 ```
 
-> **Plain read.** Three outcomes, three different chapters.
->
-> *Gain clearly positive in 1–2 and 3–5, decaying to zero by 10–20.* The
-> Phase A null was a boundary effect. The dissertation reports a
-> measured crossover and compares it against Pilászy and Tikk's
-> ten-rating figure and Strub et al.'s quintile profile.
->
-> *Flat and near zero everywhere, including 1–2.* The null is not about
-> support. The explanation lies in the features — most plausibly that a
-> TF-IDF bag of words plus twenty genre indicators carries very little
-> signal about a rating, which is what Kim et al. found on dense
-> MovieLens. This is a stronger negative result than Phase A alone.
->
-> *Gain positive but M3b still worse than M3a.* The bias channel helps
-> where the item bias is unidentified; the factor channel adds 896
-> parameters that the tail cannot support. Report both and say so.
-
 ---
 
 ## 9. Descriptive Comparison Against Phase A
-
-Restricting v8's test rows to films with at least ten training ratings
-gives a slice nominally comparable to Phase A. It is **not** a
-controlled comparison — the v8 models were trained on a different item
-set, so the factors differ — but a large discrepancy in the same
-stratum would flag that lowering $N_m$ changed the head as well as
-adding a tail, which is itself worth knowing.
 
 ```{r phaseA-comparison}
 pa_file <- file.path(OUT_DIR, "m3c_stratified_contrasts.csv")
@@ -605,22 +523,3 @@ cat("06c COMPLETE.\n")
 ```
 
 ---
-
-## 11. Limitations Specific to Phase B
-
-- **Lowering $N_m$ changes the trained model, not only the evaluation
-  slice.** Within-v8 stratified contrasts are valid; v7-vs-v8 stratum
-  comparisons are descriptive.
-- **The hyperparameters were not re-tuned for v8** beyond `lambda_c`.
-  `SVD_DIM = 16` was selected on v7's denser catalogue and a much
-  sparser item set might prefer fewer dimensions, which would flatter
-  the content term by weakening its competitor. Stated, not corrected,
-  because re-tuning would break comparability with the ladder.
-- **Films with one or two training ratings are warm by the eligibility
-  rule and cold in substance.** Any gain in those bands is closer to a
-  cold-item result than to the warm-user framing the rest of the
-  dissertation uses, and should be described that way.
-- **TMDb coverage is worse in the tail**, so the sparsest bands carry
-  more imputed runtimes and missing overviews than the head. The
-  missingness indicators make this visible to the model but do not
-  remove it as a confound between support and feature quality.
